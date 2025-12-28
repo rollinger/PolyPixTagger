@@ -85,7 +85,7 @@ class ImageCanvas(QtWidgets.QGraphicsView):
             | QtGui.QPainter.SmoothPixmapTransform
             | QtGui.QPainter.TextAntialiasing
         )
-        self.setDragMode(QtWidgets.QGraphicsView.ScrollHandDrag)
+        self.setDragMode(QtWidgets.QGraphicsView.NoDrag)
         self.setTransformationAnchor(QtWidgets.QGraphicsView.AnchorUnderMouse)
 
     def wheelEvent(self, event: QtGui.QWheelEvent):
@@ -112,6 +112,7 @@ class ImageCanvas(QtWidgets.QGraphicsView):
 class PixTagMainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
+        self.settings = QtCore.QSettings("PolyPixTagger", "PolyPixTagger")
         self.setWindowTitle("PixTag Prototype (PySide6 / Qt)")
         self.resize(1400, 900)
 
@@ -222,8 +223,8 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         # Menu + toolbar
         self._build_actions()
 
-        # Start with one default layer
-        self.add_layer(name="Layer 1")
+        # Start with last project if present
+        QtCore.QTimer.singleShot(0, self.load_last_project_on_startup)
 
     # ---------- UI Actions ----------
     def _build_actions(self):
@@ -249,7 +250,11 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         )
         act_load.triggered.connect(self.load_project_json)
         # Quit application
-        act_quit = QtGui.QAction("Quit", self)
+        act_quit = QtGui.QAction(
+            self.style().standardIcon(QtWidgets.QStyle.SP_DialogCloseButton),
+            "Quit",
+            self,
+        )
         act_quit.setShortcut(QtGui.QKeySequence.Quit) # Ctrl+Q, Cmd+Q
         act_quit.triggered.connect(self.confirm_quit)
 
@@ -267,18 +272,42 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         toolbar.addAction(act_save)
         toolbar.addSeparator()
 
-        self.act_brush = QtGui.QAction("Brush", self, checkable=True)
-        self.act_probe = QtGui.QAction("Probe", self, checkable=True)
-        self.act_entity = QtGui.QAction("Entity point", self, checkable=True)
-        group = QtGui.QActionGroup(self)
-        for a in (self.act_brush, self.act_probe, self.act_entity):
-            group.addAction(a)
-            toolbar.addAction(a)
-        self.act_brush.setChecked(True)
+        # -- General Tools --
+        self.act_pan = QtGui.QAction("Pan", self, checkable=True)
+        self.act_pan.setShortcut(QtGui.QKeySequence("Ctrl+M"))
+        self.act_pan.triggered.connect(lambda: self.set_tool("pan"))
 
-        self.act_brush.triggered.connect(lambda: self.set_tool("brush"))
+        self.act_probe = QtGui.QAction("Probe", self, checkable=True)
+        self.act_probe.setShortcut(QtGui.QKeySequence("Ctrl+P"))
         self.act_probe.triggered.connect(lambda: self.set_tool("probe"))
-        self.act_entity.triggered.connect(lambda: self.set_tool("entity_point"))
+
+        # -- Pixel Tools --
+        self.act_erase = QtGui.QAction("Erase", self, checkable=True)
+        self.act_erase.setShortcut(QtGui.QKeySequence("Ctrl+E"))
+        self.act_erase.triggered.connect(lambda: self.set_tool("erase"))
+
+        self.act_brush = QtGui.QAction("Brush", self, checkable=True)
+        self.act_brush.setShortcut(QtGui.QKeySequence("Ctrl+B"))
+        self.act_brush.triggered.connect(lambda: self.set_tool("brush"))
+
+        self.act_spray = QtGui.QAction("Spray", self, checkable=True)
+        self.act_spray.setShortcut(QtGui.QKeySequence("Ctrl+S"))
+        self.act_spray.triggered.connect(lambda: self.set_tool("spray"))
+
+        group = QtGui.QActionGroup(self)
+        for a in (self.act_pan, self.act_probe, "|", self.act_erase, self.act_brush, self.act_spray):
+            if isinstance(a, str):
+                if a == "|":
+                    toolbar.addSeparator()
+            else:
+                group.addAction(a)
+                toolbar.addAction(a)
+
+        self.act_pan.setChecked(True)
+
+        # -- Pixel Tools --
+        #self.act_entity = QtGui.QAction("Entity point", self, checkable=True)
+        #self.act_entity.triggered.connect(lambda: self.set_tool("entity_point"))
 
         toolbar.addSeparator()
         toolbar.addWidget(QtWidgets.QLabel("Brush px:"))
@@ -298,6 +327,32 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
     def set_tool(self, mode: str):
         self.tool_mode = mode
         self.lbl_tool.setText(f"tool: {mode}")
+
+        # Keep toolbar toggle state consistent even when tool is set via ESC
+        # Change Mouse Cursor to the tool's cursor'
+        if mode == "pan":
+            self.act_pan.setChecked(True)
+            self.canvas.setDragMode(QtWidgets.QGraphicsView.ScrollHandDrag)
+            self.canvas.viewport().setCursor(QtCore.Qt.OpenHandCursor)
+        elif mode == "probe":
+            self.act_probe.setChecked(True)
+            self.canvas.setDragMode(QtWidgets.QGraphicsView.NoDrag)
+            self.canvas.viewport().setCursor(QtCore.Qt.WhatsThisCursor)
+        elif mode == "brush":
+            self.act_brush.setChecked(True)
+            self.canvas.setDragMode(QtWidgets.QGraphicsView.NoDrag)
+            self.canvas.viewport().setCursor(QtCore.Qt.CrossCursor)
+        elif mode == "erase":
+            self.act_erase.setChecked(True)
+            self.canvas.setDragMode(QtWidgets.QGraphicsView.NoDrag)
+            self.canvas.viewport().setCursor(QtCore.Qt.PointingHandCursor)
+        elif mode == "spray":
+            self.act_spray.setChecked(True)
+            self.canvas.setDragMode(QtWidgets.QGraphicsView.NoDrag)
+            self.canvas.viewport().setCursor(QtCore.Qt.CrossCursor)
+        else:
+            self.canvas.setDragMode(QtWidgets.QGraphicsView.NoDrag)
+            self.canvas.viewport().unsetCursor()
 
     # ---------- Import / Scene ----------
     def import_image(self):
@@ -573,10 +628,16 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         if x < 0 or y < 0 or x >= self.project.image_width or y >= self.project.image_height:
             return
 
-        if self.tool_mode == "brush":
-            self.paint_at(int(x), int(y))
+        if self.tool_mode == "pan":
+            return # Pan is handled by the canvas itself (DragMode.ScrollHandDrag)
         elif self.tool_mode == "probe":
             self.probe_at(int(x), int(y))
+        elif self.tool_mode == "erase":
+            self.erase_at(int(x), int(y))
+        elif self.tool_mode == "brush":
+            self.paint_at(int(x), int(y))
+        elif self.tool_mode == "spray":
+            self.spray_at(int(x), int(y))
         elif self.tool_mode == "entity_point":
             self.place_entity_point(int(x), int(y))
 
@@ -592,6 +653,8 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         return img
 
     def paint_at(self, x: int, y: int):
+        """Paint a point in the mask of the current category."""
+        # TODO: continuous painting on mouse-drag (not just click), with proper stroke interpolation so it doesn’t “dot” when moving fast.
         layer = self.current_layer()
         if not layer or not self.current_category_id:
             self.status.showMessage("Select a layer and a category to paint.", 2000)
@@ -618,6 +681,16 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
 
         layer.category_masks[cat.id] = qimage_to_png_base64(mask)
         self.update_overlay_for(layer.id, cat.id, mask)
+
+    def erase_at(self, x: int, y: int):
+        """Erase a point from the mask of the current category."""
+        # TODO
+        pass
+
+    def spray_at(self, x: int, y: int):
+        """Spray paint a point in the mask of the current category."""
+        # TODO
+        pass
 
     def probe_at(self, x: int, y: int):
         layer = self.current_layer()
@@ -807,6 +880,21 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
             p.layers.append(layer)
         return p
 
+    def persist_last_project_path(self, path):
+        """Persist the last opened/saved project path"""
+        self.settings.setValue("last_project_json", path)
+
+    def load_last_project_on_startup(self):
+        path = self.settings.value("last_project_json", "", type=str)
+        if not path:
+            return
+        elif not os.path.exists(path):
+            # stale setting; clean it up
+            self.settings.remove("last_project_json")
+            return
+        else:
+            self.load_project_json(path)
+
     def save_project_json(self):
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save project JSON", "", "JSON (*.json)")
         if not path:
@@ -814,15 +902,18 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         data = self.project_to_dict()
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+        self.persist_last_project_path(path)
         self.status.showMessage(f"Saved: {path}", 2500)
 
-    def load_project_json(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load project JSON", "", "JSON (*.json)")
+    def load_project_json(self, path=None):
+        if not path:
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load project JSON", "", "JSON (*.json)")
         if not path:
             return
         try:
             with open(path, "r", encoding="utf-8") as f:
                 d = json.load(f)
+            self.persist_last_project_path(path)
         except Exception as ex:
             QtWidgets.QMessageBox.warning(self, "Load failed", str(ex))
             return
