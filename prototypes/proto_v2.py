@@ -138,6 +138,12 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
 
         # Scene
         self.scene = QtWidgets.QGraphicsScene(self)
+
+        # Tool preview ring (scene overlay, zoom-aware)
+        self.preview_ring = None
+        self.ensure_preview_ring()
+        self._last_mouse_scene_pos = None
+
         self.canvas = ImageCanvas()
         self.canvas.setScene(self.scene)
         self.canvas.mouseMoved.connect(self.on_mouse_moved)
@@ -190,7 +196,7 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         brush_layout.setContentsMargins(0, 0, 0, 0)
 
         self.spin_brush = QtWidgets.QSpinBox()
-        self.spin_brush.setRange(1, 200)
+        self.spin_brush.setRange(1, 100)
         self.spin_brush.setValue(self.brush_radius)
         self.spin_brush.valueChanged.connect(self.on_brush_radius_changed)
         brush_layout.addRow("Brush radius (px)", self.spin_brush)
@@ -201,7 +207,7 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         probe_layout.setContentsMargins(0, 0, 0, 0)
 
         self.spin_probe = QtWidgets.QSpinBox()
-        self.spin_probe.setRange(1, 500)
+        self.spin_probe.setRange(1, 100)
         self.spin_probe.setValue(self.probe_radius)
         self.spin_probe.valueChanged.connect(self.on_probe_radius_changed)
         probe_layout.addRow("Probe radius (px)", self.spin_probe)
@@ -212,7 +218,7 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         erase_layout.setContentsMargins(0, 0, 0, 0)
 
         self.spin_erase = QtWidgets.QSpinBox()
-        self.spin_erase.setRange(1, 300)
+        self.spin_erase.setRange(1, 100)
         self.spin_erase.setValue(self.erase_radius)
         self.spin_erase.valueChanged.connect(self.on_erase_radius_changed)
         erase_layout.addRow("Eraser radius (px)", self.spin_erase)
@@ -300,6 +306,24 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
 
         # Start with last project if present
         QtCore.QTimer.singleShot(0, self.load_last_project_on_startup)
+
+    def ensure_preview_ring(self):
+        # If it doesn't exist OR Qt has deleted the C++ object, recreate it
+        if getattr(self, "preview_ring", None) is not None:
+            try:
+                self.preview_ring.isVisible()  # any call that touches C++ object
+                return
+            except RuntimeError:
+                pass  # deleted
+
+        self.preview_ring = QtWidgets.QGraphicsEllipseItem()
+        pen = QtGui.QPen(QtGui.QColor(255, 255, 255, 220), 1)
+        pen.setCosmetic(True)
+        self.preview_ring.setPen(pen)
+        self.preview_ring.setBrush(QtCore.Qt.NoBrush)
+        self.preview_ring.setZValue(10_000)
+        self.preview_ring.setVisible(False)
+        self.scene.addItem(self.preview_ring)
 
     # ---------- UI Actions ----------
     def _build_actions(self):
@@ -392,6 +416,13 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         self.tool_mode = mode
         self.lbl_tool.setText(f"tool: {mode}")
 
+        # update tooling preview immediately (show/hide ring)
+        if self._last_mouse_scene_pos:
+            x, y = self._last_mouse_scene_pos
+            self.update_tool_preview_ring(x, y)
+        else:
+            self.preview_ring.setVisible(mode in ("probe", "brush", "erase"))
+
         # Keep toolbar toggle state consistent even when tool is set via ESC
         # Change Mouse Cursor to the tool's cursor'
         if mode == "pan":
@@ -402,18 +433,17 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         elif mode == "probe":
             self.act_probe.setChecked(True)
             self.canvas.setDragMode(QtWidgets.QGraphicsView.NoDrag)
-            #self.canvas.viewport().setCursor(QtCore.Qt.WhatsThisCursor)
-            self.canvas.viewport().setCursor(self.make_circle_cursor(self.probe_radius))
+            self.canvas.viewport().setCursor(QtCore.Qt.WhatsThisCursor)
             self.tool_stack.setCurrentIndex(2)
         elif mode == "brush":
             self.act_brush.setChecked(True)
             self.canvas.setDragMode(QtWidgets.QGraphicsView.NoDrag)
-            self.canvas.viewport().setCursor(self.make_circle_cursor(self.brush_radius))
+            self.canvas.viewport().setCursor(QtCore.Qt.CrossCursor)
             self.tool_stack.setCurrentIndex(1)
         elif mode == "erase":
             self.act_erase.setChecked(True)
             self.canvas.setDragMode(QtWidgets.QGraphicsView.NoDrag)
-            self.canvas.viewport().setCursor(self.make_circle_cursor(self.erase_radius))
+            self.canvas.viewport().setCursor(QtCore.Qt.CrossCursor)
             self.tool_stack.setCurrentIndex(3)
         elif mode == "spray":
             self.act_spray.setChecked(True)
@@ -443,6 +473,7 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         self.project.image_height = img.height()
 
         self.scene.clear()
+        self.ensure_preview_ring()
         self.overlay_items.clear()
         self.entity_items.clear()
 
@@ -690,24 +721,30 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         self.lbl_sel.setText(f"layer: {layer_name}, category: {cat_name}, entity: {ent_name}")
 
     # ---------- Painting + Probing ----------
-
-    def apply_tool_cursor(self):
+    def update_tool_preview_ring(self, x: float, y: float):
+        self.ensure_preview_ring()
+        # only show for tools that operate with a radius
         if self.tool_mode == "brush":
-            self.canvas.viewport().setCursor(self.make_circle_cursor(self.brush_radius))
+            r = self.brush_radius
         elif self.tool_mode == "erase":
-            self.canvas.viewport().setCursor(self.make_circle_cursor(self.erase_radius))
-        elif self.tool_mode == "pan":
-            self.canvas.viewport().setCursor(QtCore.Qt.OpenHandCursor)
+            r = self.erase_radius
         elif self.tool_mode == "probe":
-            #self.canvas.viewport().setCursor(QtCore.Qt.WhatsThisCursor)
-            self.canvas.viewport().setCursor(self.make_circle_cursor(self.probe_radius))
-        elif self.tool_mode == "entity_point":
-            self.canvas.viewport().setCursor(QtCore.Qt.CrossCursor)
+            r = self.probe_radius
         else:
-            self.canvas.viewport().unsetCursor()
+            self.preview_ring.setVisible(False)
+            return
+
+        if r <= 0:
+            self.preview_ring.setVisible(False)
+            return
+
+        self.preview_ring.setRect(x - r, y - r, 2 * r, 2 * r)
+        self.preview_ring.setVisible(True)
 
     def on_mouse_moved(self, x: float, y: float):
+        self._last_mouse_scene_pos = (x, y)
         self.lbl_pos.setText(f"x: {x:.1f}, y: {y:.1f}")
+        self.update_tool_preview_ring(x, y)
 
     def on_mouse_clicked(self, x: float, y: float):
         if not self.project.image_path:
@@ -728,34 +765,6 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         elif self.tool_mode == "entity_point":
             self.place_entity_point(int(x), int(y))
 
-    def make_circle_cursor(self, radius: int) -> QtGui.QCursor:
-        # Cursor pixmaps can be limited by platform; keep reasonable size
-        r = max(1, int(radius))
-        size = min(256, (r * 2) + 6)  # clamp to avoid huge cursors
-        pix = QtGui.QPixmap(size, size)
-        pix.fill(QtCore.Qt.transparent)
-
-        p = QtGui.QPainter(pix)
-        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
-
-        pen = QtGui.QPen(QtGui.QColor(255, 255, 255, 220), 2)
-        p.setPen(pen)
-        p.setBrush(QtCore.Qt.NoBrush)
-
-        center = size // 2
-        draw_r = min(r, (size // 2) - 3)
-        p.drawEllipse(QtCore.QPointF(center, center), draw_r, draw_r)
-
-        # optional: dark outline for contrast
-        pen2 = QtGui.QPen(QtGui.QColor(0, 0, 0, 200), 1)
-        p.setPen(pen2)
-        p.drawEllipse(QtCore.QPointF(center, center), draw_r + 1, draw_r + 1)
-
-        p.end()
-
-        hotspot = QtCore.QPoint(center, center)
-        return QtGui.QCursor(pix, hotspot.x(), hotspot.y())
-
     def ensure_mask_image(self, layer: Layer, category_id: str) -> QtGui.QImage:
         b64 = layer.category_masks.get(category_id)
         if b64:
@@ -769,8 +778,8 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
 
     def on_brush_radius_changed(self, v: int):
         self.brush_radius = int(v)
-        if self.tool_mode == "brush":
-            self.apply_tool_cursor()
+        if self._last_mouse_scene_pos:
+            self.update_tool_preview_ring(*self._last_mouse_scene_pos)
 
     def paint_at(self, x: int, y: int):
         """Paint a point in the mask of the current category."""
@@ -804,8 +813,8 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
 
     def on_erase_radius_changed(self, v: int):
         self.erase_radius = int(v)
-        if self.tool_mode == "erase":
-            self.apply_tool_cursor()
+        if self._last_mouse_scene_pos:
+            self.update_tool_preview_ring(*self._last_mouse_scene_pos)
 
     def on_erase_mode_changed(self, _idx: int):
         self.erase_mode = self.combo_erase_mode.currentData()
@@ -864,8 +873,8 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
 
     def on_probe_radius_changed(self, v: int):
         self.probe_radius = int(v)
-        if self.tool_mode == "probe":
-            self.apply_tool_cursor()
+        if self._last_mouse_scene_pos:
+            self.update_tool_preview_ring(*self._last_mouse_scene_pos)
 
     def probe_at(self, x: int, y: int):
         layer = self.current_layer()
@@ -1101,6 +1110,7 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
             img = QtGui.QImage(self.project.image_path)
             if not img.isNull():
                 self.scene.clear()
+                self.ensure_preview_ring()
                 self.overlay_items.clear()
                 self.entity_items.clear()
                 self.base_pixmap_item = self.scene.addPixmap(QtGui.QPixmap.fromImage(img))
@@ -1110,6 +1120,7 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
                 self.canvas.fitInView(self.scene.sceneRect(), QtCore.Qt.KeepAspectRatio)
         else:
             self.scene.clear()
+            self.ensure_preview_ring()
             self.overlay_items.clear()
             self.entity_items.clear()
             self.base_pixmap_item = None
