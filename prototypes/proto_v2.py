@@ -106,8 +106,14 @@ class ImageCanvas(QtWidgets.QGraphicsView):
         if event.button() == QtCore.Qt.LeftButton:
             p = self.mapToScene(event.position().toPoint())
             self.mouseClicked.emit(p.x(), p.y())
+        if event.button() == QtCore.Qt.LeftButton and self.dragMode() == QtWidgets.QGraphicsView.ScrollHandDrag:
+            self.viewport().setCursor(QtCore.Qt.ClosedHandCursor)
         super().mousePressEvent(event)
 
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent):
+        if self.dragMode() == QtWidgets.QGraphicsView.ScrollHandDrag:
+            self.viewport().setCursor(QtCore.Qt.OpenHandCursor)
+        super().mouseReleaseEvent(event)
 
 class PixTagMainWindow(QtWidgets.QMainWindow):
     def __init__(self):
@@ -120,8 +126,10 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
 
         # Tool state
         self.tool_mode = "brush"  # brush | probe | entity_point
-        self.brush_radius = 12
-        self.probe_radius = 20
+        self.brush_radius = 6
+        self.probe_radius = 6
+        self.erase_radius = 6
+        self.erase_mode = "erase_all"  # erase_all | erase_only_category | erase_all_but_category
 
         # Selection state
         self.current_layer_id: Optional[str] = None
@@ -173,30 +181,97 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         right_layout = QtWidgets.QVBoxLayout(right)
         right_layout.setContentsMargins(8, 8, 8, 8)
 
+        # --- Tooling pane (RIGHT, top) ---
+        self.tool_stack = QtWidgets.QStackedWidget()
+
+        # Brush page
+        brush_page = QtWidgets.QWidget()
+        brush_layout = QtWidgets.QFormLayout(brush_page)
+        brush_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.spin_brush = QtWidgets.QSpinBox()
+        self.spin_brush.setRange(1, 200)
+        self.spin_brush.setValue(self.brush_radius)
+        self.spin_brush.valueChanged.connect(self.on_brush_radius_changed)
+        brush_layout.addRow("Brush radius (px)", self.spin_brush)
+
+        # Probe page
+        probe_page = QtWidgets.QWidget()
+        probe_layout = QtWidgets.QFormLayout(probe_page)
+        probe_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.spin_probe = QtWidgets.QSpinBox()
+        self.spin_probe.setRange(1, 500)
+        self.spin_probe.setValue(self.probe_radius)
+        self.spin_probe.valueChanged.connect(self.on_probe_radius_changed)
+        probe_layout.addRow("Probe radius (px)", self.spin_probe)
+
+        # Erase page
+        erase_page = QtWidgets.QWidget()
+        erase_layout = QtWidgets.QFormLayout(erase_page)
+        erase_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.spin_erase = QtWidgets.QSpinBox()
+        self.spin_erase.setRange(1, 300)
+        self.spin_erase.setValue(self.erase_radius)
+        self.spin_erase.valueChanged.connect(self.on_erase_radius_changed)
+        erase_layout.addRow("Eraser radius (px)", self.spin_erase)
+
+        self.combo_erase_mode = QtWidgets.QComboBox()
+        self.combo_erase_mode.addItem("Erase all", "erase_all")
+        self.combo_erase_mode.addItem("Erase only category", "erase_only_category")
+        self.combo_erase_mode.addItem("Erase all but category", "erase_all_but_category")
+        self.combo_erase_mode.currentIndexChanged.connect(self.on_erase_mode_changed)
+        erase_layout.addRow("Mode", self.combo_erase_mode)
+
+        # Optional page for tools without params (Pan/Entity) - can be empty or a label
+        empty_page = QtWidgets.QWidget()
+        empty_layout = QtWidgets.QVBoxLayout(empty_page)
+        empty_layout.setContentsMargins(0, 0, 0, 0)
+        empty_layout.addWidget(QtWidgets.QLabel("No parameters for this tool."))
+
+        # Add pages in a known order
+        self.tool_stack.addWidget(empty_page)  # index 0
+        self.tool_stack.addWidget(brush_page)  # index 1
+        self.tool_stack.addWidget(probe_page)  # index 2
+        self.tool_stack.addWidget(erase_page)  # index 3
+
+        tool_group = QtWidgets.QGroupBox("Tooling")
+        tool_group_layout = QtWidgets.QVBoxLayout(tool_group)
+        tool_group_layout.addWidget(self.tool_stack)
+
+        # Put tooling pane ABOVE Layers
+        right_layout.addWidget(tool_group)
+        right_layout.addSpacing(6)
+
+        # --- Layer pane (RIGHT) ---
         right_layout.addWidget(QtWidgets.QLabel("Layers"))
         right_layout.addWidget(self.layer_list, 1)
         rowL = QtWidgets.QHBoxLayout()
         rowL.addWidget(self.btn_add_layer)
         rowL.addWidget(self.btn_del_layer)
         right_layout.addLayout(rowL)
-
         right_layout.addSpacing(6)
+
+        # --- Categories pane (RIGHT) ---
         right_layout.addWidget(QtWidgets.QLabel("Categories (per layer)"))
         right_layout.addWidget(self.category_list, 1)
         rowC = QtWidgets.QHBoxLayout()
         rowC.addWidget(self.btn_add_cat)
         rowC.addWidget(self.btn_del_cat)
         right_layout.addLayout(rowC)
-
         right_layout.addSpacing(6)
+
+        # --- Entities pane (RIGHT) ---
         right_layout.addWidget(QtWidgets.QLabel("Entities (per layer)"))
         right_layout.addWidget(self.entity_list, 1)
         rowE = QtWidgets.QHBoxLayout()
         rowE.addWidget(self.btn_add_ent)
         rowE.addWidget(self.btn_del_ent)
         right_layout.addLayout(rowE)
-
         right_layout.addSpacing(6)
+
+        # --- Entity Properties pane (RIGHT) ---
         right_layout.addWidget(QtWidgets.QLabel("Selected entity properties (JSON)"))
         right_layout.addWidget(self.props_editor, 2)
         right_layout.addWidget(self.btn_apply_props)
@@ -284,6 +359,7 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         # -- Pixel Tools --
         self.act_erase = QtGui.QAction("Erase", self, checkable=True)
         self.act_erase.setShortcut(QtGui.QKeySequence("Ctrl+E"))
+        self.act_erase.setShortcutContext(QtCore.Qt.ApplicationShortcut)
         self.act_erase.triggered.connect(lambda: self.set_tool("erase"))
 
         self.act_brush = QtGui.QAction("Brush", self, checkable=True)
@@ -303,26 +379,14 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
                 group.addAction(a)
                 toolbar.addAction(a)
 
+        # Default to pan tool
         self.act_pan.setChecked(True)
+        self.set_tool("pan")
 
         # -- Pixel Tools --
         #self.act_entity = QtGui.QAction("Entity point", self, checkable=True)
         #self.act_entity.triggered.connect(lambda: self.set_tool("entity_point"))
 
-        toolbar.addSeparator()
-        toolbar.addWidget(QtWidgets.QLabel("Brush px:"))
-        self.spin_brush = QtWidgets.QSpinBox()
-        self.spin_brush.setRange(1, 200)
-        self.spin_brush.setValue(self.brush_radius)
-        self.spin_brush.valueChanged.connect(lambda v: setattr(self, "brush_radius", int(v)))
-        toolbar.addWidget(self.spin_brush)
-
-        toolbar.addWidget(QtWidgets.QLabel("Probe r:"))
-        self.spin_probe = QtWidgets.QSpinBox()
-        self.spin_probe.setRange(1, 500)
-        self.spin_probe.setValue(self.probe_radius)
-        self.spin_probe.valueChanged.connect(lambda v: setattr(self, "probe_radius", int(v)))
-        toolbar.addWidget(self.spin_probe)
 
     def set_tool(self, mode: str):
         self.tool_mode = mode
@@ -334,25 +398,32 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
             self.act_pan.setChecked(True)
             self.canvas.setDragMode(QtWidgets.QGraphicsView.ScrollHandDrag)
             self.canvas.viewport().setCursor(QtCore.Qt.OpenHandCursor)
+            self.tool_stack.setCurrentIndex(0)
         elif mode == "probe":
             self.act_probe.setChecked(True)
             self.canvas.setDragMode(QtWidgets.QGraphicsView.NoDrag)
-            self.canvas.viewport().setCursor(QtCore.Qt.WhatsThisCursor)
+            #self.canvas.viewport().setCursor(QtCore.Qt.WhatsThisCursor)
+            self.canvas.viewport().setCursor(self.make_circle_cursor(self.probe_radius))
+            self.tool_stack.setCurrentIndex(2)
         elif mode == "brush":
             self.act_brush.setChecked(True)
             self.canvas.setDragMode(QtWidgets.QGraphicsView.NoDrag)
-            self.canvas.viewport().setCursor(QtCore.Qt.CrossCursor)
+            self.canvas.viewport().setCursor(self.make_circle_cursor(self.brush_radius))
+            self.tool_stack.setCurrentIndex(1)
         elif mode == "erase":
             self.act_erase.setChecked(True)
             self.canvas.setDragMode(QtWidgets.QGraphicsView.NoDrag)
-            self.canvas.viewport().setCursor(QtCore.Qt.PointingHandCursor)
+            self.canvas.viewport().setCursor(self.make_circle_cursor(self.erase_radius))
+            self.tool_stack.setCurrentIndex(3)
         elif mode == "spray":
             self.act_spray.setChecked(True)
             self.canvas.setDragMode(QtWidgets.QGraphicsView.NoDrag)
             self.canvas.viewport().setCursor(QtCore.Qt.CrossCursor)
+            self.tool_stack.setCurrentIndex(0)
         else:
             self.canvas.setDragMode(QtWidgets.QGraphicsView.NoDrag)
             self.canvas.viewport().unsetCursor()
+            self.tool_stack.setCurrentIndex(0)
 
     # ---------- Import / Scene ----------
     def import_image(self):
@@ -619,6 +690,22 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         self.lbl_sel.setText(f"layer: {layer_name}, category: {cat_name}, entity: {ent_name}")
 
     # ---------- Painting + Probing ----------
+
+    def apply_tool_cursor(self):
+        if self.tool_mode == "brush":
+            self.canvas.viewport().setCursor(self.make_circle_cursor(self.brush_radius))
+        elif self.tool_mode == "erase":
+            self.canvas.viewport().setCursor(self.make_circle_cursor(self.erase_radius))
+        elif self.tool_mode == "pan":
+            self.canvas.viewport().setCursor(QtCore.Qt.OpenHandCursor)
+        elif self.tool_mode == "probe":
+            #self.canvas.viewport().setCursor(QtCore.Qt.WhatsThisCursor)
+            self.canvas.viewport().setCursor(self.make_circle_cursor(self.probe_radius))
+        elif self.tool_mode == "entity_point":
+            self.canvas.viewport().setCursor(QtCore.Qt.CrossCursor)
+        else:
+            self.canvas.viewport().unsetCursor()
+
     def on_mouse_moved(self, x: float, y: float):
         self.lbl_pos.setText(f"x: {x:.1f}, y: {y:.1f}")
 
@@ -641,6 +728,34 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         elif self.tool_mode == "entity_point":
             self.place_entity_point(int(x), int(y))
 
+    def make_circle_cursor(self, radius: int) -> QtGui.QCursor:
+        # Cursor pixmaps can be limited by platform; keep reasonable size
+        r = max(1, int(radius))
+        size = min(256, (r * 2) + 6)  # clamp to avoid huge cursors
+        pix = QtGui.QPixmap(size, size)
+        pix.fill(QtCore.Qt.transparent)
+
+        p = QtGui.QPainter(pix)
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+
+        pen = QtGui.QPen(QtGui.QColor(255, 255, 255, 220), 2)
+        p.setPen(pen)
+        p.setBrush(QtCore.Qt.NoBrush)
+
+        center = size // 2
+        draw_r = min(r, (size // 2) - 3)
+        p.drawEllipse(QtCore.QPointF(center, center), draw_r, draw_r)
+
+        # optional: dark outline for contrast
+        pen2 = QtGui.QPen(QtGui.QColor(0, 0, 0, 200), 1)
+        p.setPen(pen2)
+        p.drawEllipse(QtCore.QPointF(center, center), draw_r + 1, draw_r + 1)
+
+        p.end()
+
+        hotspot = QtCore.QPoint(center, center)
+        return QtGui.QCursor(pix, hotspot.x(), hotspot.y())
+
     def ensure_mask_image(self, layer: Layer, category_id: str) -> QtGui.QImage:
         b64 = layer.category_masks.get(category_id)
         if b64:
@@ -651,6 +766,11 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         img = QtGui.QImage(self.project.image_width, self.project.image_height, QtGui.QImage.Format_RGBA8888)
         img.fill(QtGui.QColor(0, 0, 0, 0))
         return img
+
+    def on_brush_radius_changed(self, v: int):
+        self.brush_radius = int(v)
+        if self.tool_mode == "brush":
+            self.apply_tool_cursor()
 
     def paint_at(self, x: int, y: int):
         """Paint a point in the mask of the current category."""
@@ -682,15 +802,70 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         layer.category_masks[cat.id] = qimage_to_png_base64(mask)
         self.update_overlay_for(layer.id, cat.id, mask)
 
+    def on_erase_radius_changed(self, v: int):
+        self.erase_radius = int(v)
+        if self.tool_mode == "erase":
+            self.apply_tool_cursor()
+
+    def on_erase_mode_changed(self, _idx: int):
+        self.erase_mode = self.combo_erase_mode.currentData()
+
     def erase_at(self, x: int, y: int):
-        """Erase a point from the mask of the current category."""
-        # TODO
-        pass
+        layer = self.current_layer()
+        if not layer:
+            self.status.showMessage("Select a layer to erase.", 2000)
+            return
+
+        r = self.erase_radius
+        mode = self.erase_mode
+
+        # For category-specific modes we need a selected category
+        if mode in ("erase_only_category", "erase_all_but_category") and not self.current_category_id:
+            self.status.showMessage("Select a category for this erase mode.", 2500)
+            return
+
+        def erase_circle(mask_img: QtGui.QImage):
+            painter = QtGui.QPainter(mask_img)
+            painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+            painter.setCompositionMode(QtGui.QPainter.CompositionMode_Clear)
+            painter.setPen(QtCore.Qt.NoPen)
+            painter.setBrush(QtGui.QBrush(QtGui.QColor(0, 0, 0, 255)))
+            painter.drawEllipse(QtCore.QPointF(x, y), r, r)
+            painter.end()
+
+        # Determine which category masks to affect
+        if mode == "erase_all":
+            target_category_ids = [c.id for c in layer.categories]
+        elif mode == "erase_only_category":
+            target_category_ids = [self.current_category_id]
+        elif mode == "erase_all_but_category":
+            target_category_ids = [c.id for c in layer.categories if c.id != self.current_category_id]
+        else:
+            target_category_ids = []
+
+        if not target_category_ids:
+            return
+
+        for cid in target_category_ids:
+            # Skip categories that don't exist in this layer
+            if not any(c.id == cid for c in layer.categories):
+                continue
+
+            mask = self.ensure_mask_image(layer, cid)
+            erase_circle(mask)
+
+            layer.category_masks[cid] = qimage_to_png_base64(mask)
+            self.update_overlay_for(layer.id, cid, mask)
 
     def spray_at(self, x: int, y: int):
         """Spray paint a point in the mask of the current category."""
         # TODO
         pass
+
+    def on_probe_radius_changed(self, v: int):
+        self.probe_radius = int(v)
+        if self.tool_mode == "probe":
+            self.apply_tool_cursor()
 
     def probe_at(self, x: int, y: int):
         layer = self.current_layer()
