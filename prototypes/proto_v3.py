@@ -168,6 +168,7 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
 
         # Buttons on right panel
         self.btn_add_layer = QtWidgets.QPushButton("Add layer")
+        self.btn_edit_layer = QtWidgets.QPushButton("Edit layer")
         self.btn_del_layer = QtWidgets.QPushButton("Delete layer")
         self.btn_add_cat = QtWidgets.QPushButton("Add category")
         self.btn_del_cat = QtWidgets.QPushButton("Delete category")
@@ -175,6 +176,7 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         self.btn_del_ent = QtWidgets.QPushButton("Delete entity")
         self.btn_apply_props = QtWidgets.QPushButton("Apply entity JSON")
         self.btn_add_layer.clicked.connect(self.add_layer)
+        self.btn_edit_layer.clicked.connect(self.edit_layer)
         self.btn_del_layer.clicked.connect(self.delete_layer)
         self.btn_add_cat.clicked.connect(self.add_category)
         self.btn_del_cat.clicked.connect(self.delete_category)
@@ -255,6 +257,7 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         right_layout.addWidget(self.layer_list, 1)
         rowL = QtWidgets.QHBoxLayout()
         rowL.addWidget(self.btn_add_layer)
+        rowL.addWidget(self.btn_edit_layer)
         rowL.addWidget(self.btn_del_layer)
         right_layout.addLayout(rowL)
         right_layout.addSpacing(6)
@@ -499,15 +502,15 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
                 return l
         return None
 
-    def add_layer(self, name: Optional[str] = None):
-        if name is None:
-            name, ok = QtWidgets.QInputDialog.getText(self, "Add layer", "Layer name:")
-            if not ok or not name.strip():
-                return
-            name = name.strip()
+    def add_layer(self, name = None):
+        name, ok = QtWidgets.QInputDialog.getText(self, "Add layer", "Layer name:")
+        name = name.strip()
+        if not ok or not name:
+            return
 
         layer = Layer(id=new_id(), name=name)
         self.project.layers.append(layer)
+        self.current_layer_id = layer.id
         self.refresh_layer_list(select_id=layer.id)
 
     def delete_layer(self):
@@ -521,6 +524,17 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         self.rebuild_overlays()
         self.rebuild_entities()
         self.update_selection_label()
+
+    def edit_layer(self):
+        if not self.current_layer_id:
+            return
+        current_name = self.current_layer().name
+        new_name, ok = QtWidgets.QInputDialog.getText(self, "Edit layer name", "New layer name:", text=current_name)
+        if not ok or not new_name.strip():
+            return
+        self.current_layer().name = new_name.strip()
+        self.refresh_layer_list()
+
 
     def add_category(self):
         layer = self.current_layer()
