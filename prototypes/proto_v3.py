@@ -42,7 +42,7 @@ class Category:
     id: str
     name: str
     color: Tuple[int, int, int, int]  # RGBA
-
+    index: int  # 1..255 (0 reserved for "none")
 
 @dataclass
 class Entity:
@@ -54,16 +54,14 @@ class Entity:
     x: float = 0.0
     y: float = 0.0
 
-
 @dataclass
 class Layer:
     id: str
     name: str
     categories: List[Category] = field(default_factory=list)
     entities: List[Entity] = field(default_factory=list)
-    # category_id -> mask (stored as base64 png in JSON)
-    category_masks: Dict[str, Optional[str]] = field(default_factory=dict)
-
+    # One label-map per layer (0..255), stored as PNG base64 in JSON
+    mask_index_png_b64: Optional[str] = None
 
 @dataclass
 class Project:
@@ -151,7 +149,7 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
 
         self.base_pixmap_item: Optional[QtWidgets.QGraphicsPixmapItem] = None
         # category overlay pixmap items: (layer_id, category_id) -> item
-        self.overlay_items: Dict[Tuple[str, str], QtWidgets.QGraphicsPixmapItem] = {}
+        self.layer_overlay_items: Dict[str, QtWidgets.QGraphicsPixmapItem] = {}
         # entity graphics items: entity_id -> item
         self.entity_items: Dict[str, QtWidgets.QGraphicsItem] = {}
 
@@ -307,7 +305,14 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         # Menu + toolbar
         self._build_actions()
 
-        # Start with last project if present
+        # Add a default layer if none exist
+        if not self.project.layers:
+            # Create at least one layer so UI is usable
+            layer = Layer(id=new_id(), name="Layer 1")
+            self.project.layers.append(layer)
+            self.refresh_layer_list(select_id=layer.id)
+
+        # Load last project if present
         QtCore.QTimer.singleShot(0, self.load_last_project_on_startup)
 
     def ensure_preview_ring(self):
@@ -489,7 +494,7 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
 
         self.scene.clear()
         self.ensure_preview_ring()
-        self.overlay_items.clear()
+        self.layer_overlay_items.clear()
         self.entity_items.clear()
 
         self.base_pixmap_item = self.scene.addPixmap(QtGui.QPixmap.fromImage(img))
@@ -563,7 +568,14 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         if not c.isValid():
             c = QtGui.QColor(50, 200, 50, 140)
 
-        cat = Category(id=new_id(), name=name, color=qcolor_to_rgba_tuple(c))
+        used = {cc.index for cc in layer.categories if getattr(cc, "index", None) is not None}
+        idx = next((i for i in range(1, 256) if i not in used), None)
+        if idx is None:
+            QtWidgets.QMessageBox.warning(self, "Too many categories", "Max 255 categories per layer.")
+            return
+
+        cat = Category(id=new_id(), name=name, color=qcolor_to_rgba_tuple(c), index=idx)
+
         layer.categories.append(cat)
         layer.category_masks.setdefault(cat.id, None)
 
@@ -576,9 +588,22 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
             return
 
         cid = self.current_category_id
+        deleted = next((c for c in layer.categories if c.id == cid), None)
+        deleted_index = deleted.index if deleted else None
+
         layer.categories = [c for c in layer.categories if c.id != cid]
         if cid in layer.category_masks:
             del layer.category_masks[cid]
+
+        if deleted_index is not None and self.project.image_path:
+            mask = self.ensure_layer_index_mask(layer)
+            mbytes = self._qimage_bytes(mask)
+            # full scan clear (can be expensive, but deleting categories is rare)
+            for i in range(mask.sizeInBytes()):
+                if mbytes[i] == deleted_index:
+                    mbytes[i] = 0
+            # refresh full overlay
+            self.rebuild_overlays()
 
         # also detach entities from that category
         for e in layer.entities:
@@ -789,16 +814,91 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         elif self.tool_mode == "entity_point":
             self.place_entity_point(int(x), int(y))
 
-    def ensure_mask_image(self, layer: Layer, category_id: str) -> QtGui.QImage:
-        b64 = layer.category_masks.get(category_id)
-        if b64:
-            img = png_base64_to_qimage(b64)
-            if not img.isNull():
-                return img.convertToFormat(QtGui.QImage.Format_RGBA8888)
-        # create empty transparent mask
-        img = QtGui.QImage(self.project.image_width, self.project.image_height, QtGui.QImage.Format_RGBA8888)
-        img.fill(QtGui.QColor(0, 0, 0, 0))
-        return img
+    def ensure_layer_index_mask(self, layer: Layer) -> QtGui.QImage:
+        # runtime cache
+        img = getattr(layer, "mask_index_img", None)
+        if isinstance(img, QtGui.QImage) and not img.isNull():
+            # ensure correct size
+            if img.width() == self.project.image_width and img.height() == self.project.image_height:
+                return img
+
+        # load from JSON b64 once
+        if layer.mask_index_png_b64:
+            loaded = png_base64_to_qimage(layer.mask_index_png_b64)
+            if not loaded.isNull():
+                loaded = loaded.convertToFormat(QtGui.QImage.Format_Grayscale8)
+                # if size mismatch, reset
+                if loaded.width() != self.project.image_width or loaded.height() != self.project.image_height:
+                    loaded = None
+                else:
+                    layer.mask_index_img = loaded
+                    return loaded
+
+        # create blank
+        blank = QtGui.QImage(self.project.image_width, self.project.image_height, QtGui.QImage.Format_Grayscale8)
+        blank.fill(0)
+        layer.mask_index_img = blank
+        return blank
+
+    def ensure_layer_overlay_image(self, layer: Layer) -> QtGui.QImage:
+        rgba = getattr(layer, "overlay_rgba_img", None)
+        if isinstance(rgba, QtGui.QImage) and not rgba.isNull():
+            if rgba.width() == self.project.image_width and rgba.height() == self.project.image_height:
+                return rgba
+
+        rgba = QtGui.QImage(self.project.image_width, self.project.image_height, QtGui.QImage.Format_RGBA8888)
+        rgba.fill(QtGui.QColor(0, 0, 0, 0))
+        layer.overlay_rgba_img = rgba
+        return rgba
+
+    def update_layer_overlay(self, layer: Layer, dirty_rect: QtCore.QRect):
+        if not self.project.image_path:
+            return
+
+        mask = self.ensure_layer_index_mask(layer)
+        overlay = self.ensure_layer_overlay_image(layer)
+
+        # clamp dirty rect
+        dr = dirty_rect.intersected(QtCore.QRect(0, 0, self.project.image_width, self.project.image_height))
+        if dr.isEmpty():
+            return
+
+        lut = self._category_lut_rgba(layer)
+        mbytes = self._qimage_bytes(mask)
+        obytes = self._qimage_bytes(overlay)
+
+        w = self.project.image_width
+        # Grayscale8: 1 byte per pixel
+        # RGBA8888: 4 bytes per pixel
+        for y in range(dr.top(), dr.bottom() + 1):
+            mrow = y * mask.bytesPerLine()
+            orow = y * overlay.bytesPerLine()
+            x0 = dr.left()
+            x1 = dr.right()
+
+            mi = mrow + x0
+            oi = orow + (x0 * 4)
+
+            # per pixel in dirty span
+            for x in range(x0, x1 + 1):
+                idx = mbytes[mi]
+                rgba = lut[idx]
+                obytes[oi:oi + 4] = rgba
+                mi += 1
+                oi += 4
+
+        # push overlay pixmap to scene
+        item = self.layer_overlay_items.get(layer.id)
+        pm = QtGui.QPixmap.fromImage(overlay)
+
+        if item is None:
+            item = self.scene.addPixmap(pm)
+            item.setZValue(10)
+            item.setOpacity(0.55)
+            item.setPos(0, 0)
+            self.layer_overlay_items[layer.id] = item
+        else:
+            item.setPixmap(pm)
 
     def on_brush_radius_changed(self, v: int):
         self.brush_radius = int(v)
@@ -806,34 +906,42 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
             self.update_tool_preview_ring(*self._last_mouse_scene_pos)
 
     def paint_at(self, x: int, y: int):
-        """Paint a point in the mask of the current category."""
         # TODO: continuous painting on mouse-drag (not just click), with proper stroke interpolation so it doesn’t “dot” when moving fast.
         layer = self.current_layer()
         if not layer or not self.current_category_id:
             self.status.showMessage("Select a layer and a category to paint.", 2000)
             return
+
         cat = next((c for c in layer.categories if c.id == self.current_category_id), None)
         if not cat:
             return
 
-        mask = self.ensure_mask_image(layer, cat.id)
-
-        painter = QtGui.QPainter(mask)
-        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
-
-        # paint with category color, but keep alpha strong for mask visibility
-        qc = rgba_tuple_to_qcolor(cat.color)
-        qc.setAlpha(200)
-
-        brush = QtGui.QBrush(qc)
-        painter.setBrush(brush)
-        painter.setPen(QtCore.Qt.NoPen)
+        mask = self.ensure_layer_index_mask(layer)
         r = self.brush_radius
-        painter.drawEllipse(QtCore.QPointF(x, y), r, r)
-        painter.end()
+        if r <= 0:
+            return
 
-        layer.category_masks[cat.id] = qimage_to_png_base64(mask)
-        self.update_overlay_for(layer.id, cat.id, mask)
+        mbytes = self._qimage_bytes(mask)
+        bpl = mask.bytesPerLine()
+
+        x0 = max(0, x - r)
+        x1 = min(self.project.image_width - 1, x + r)
+        y0 = max(0, y - r)
+        y1 = min(self.project.image_height - 1, y + r)
+
+        rr = r * r
+        idx = cat.index
+
+        for yy in range(y0, y1 + 1):
+            dy = yy - y
+            row = yy * bpl
+            for xx in range(x0, x1 + 1):
+                dx = xx - x
+                if dx * dx + dy * dy <= rr:
+                    mbytes[row + xx] = idx
+
+        dirty = QtCore.QRect(x0, y0, (x1 - x0 + 1), (y1 - y0 + 1))
+        self.update_layer_overlay(layer, dirty)
 
     def on_erase_radius_changed(self, v: int):
         self.erase_radius = int(v)
@@ -850,45 +958,57 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
             return
 
         r = self.erase_radius
+        if r <= 0:
+            return
+
         mode = self.erase_mode
 
-        # For category-specific modes we need a selected category
-        if mode in ("erase_only_category", "erase_all_but_category") and not self.current_category_id:
-            self.status.showMessage("Select a category for this erase mode.", 2500)
-            return
+        selected_cat = None
+        selected_idx = None
+        if mode in ("erase_only_category", "erase_all_but_category"):
+            if not self.current_category_id:
+                self.status.showMessage("Select a category for this erase mode.", 2500)
+                return
+            selected_cat = next((c for c in layer.categories if c.id == self.current_category_id), None)
+            if not selected_cat:
+                return
+            selected_idx = selected_cat.index
 
-        def erase_circle(mask_img: QtGui.QImage):
-            painter = QtGui.QPainter(mask_img)
-            painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
-            painter.setCompositionMode(QtGui.QPainter.CompositionMode_Clear)
-            painter.setPen(QtCore.Qt.NoPen)
-            painter.setBrush(QtGui.QBrush(QtGui.QColor(0, 0, 0, 255)))
-            painter.drawEllipse(QtCore.QPointF(x, y), r, r)
-            painter.end()
+        mask = self.ensure_layer_index_mask(layer)
+        mbytes = self._qimage_bytes(mask)
+        bpl = mask.bytesPerLine()
 
-        # Determine which category masks to affect
-        if mode == "erase_all":
-            target_category_ids = [c.id for c in layer.categories]
-        elif mode == "erase_only_category":
-            target_category_ids = [self.current_category_id]
-        elif mode == "erase_all_but_category":
-            target_category_ids = [c.id for c in layer.categories if c.id != self.current_category_id]
-        else:
-            target_category_ids = []
+        x0 = max(0, x - r)
+        x1 = min(self.project.image_width - 1, x + r)
+        y0 = max(0, y - r)
+        y1 = min(self.project.image_height - 1, y + r)
 
-        if not target_category_ids:
-            return
+        rr = r * r
 
-        for cid in target_category_ids:
-            # Skip categories that don't exist in this layer
-            if not any(c.id == cid for c in layer.categories):
-                continue
+        for yy in range(y0, y1 + 1):
+            dy = yy - y
+            row = yy * bpl
+            for xx in range(x0, x1 + 1):
+                dx = xx - x
+                if dx * dx + dy * dy > rr:
+                    continue
 
-            mask = self.ensure_mask_image(layer, cid)
-            erase_circle(mask)
+                pos = row + xx
+                cur = mbytes[pos]
 
-            layer.category_masks[cid] = qimage_to_png_base64(mask)
-            self.update_overlay_for(layer.id, cid, mask)
+                if mode == "erase_all":
+                    if cur != 0:
+                        mbytes[pos] = 0
+                elif mode == "erase_only_category":
+                    if cur == selected_idx:
+                        mbytes[pos] = 0
+                elif mode == "erase_all_but_category":
+                    # erase everything except the selected category (and keep empty as empty)
+                    if cur != 0 and cur != selected_idx:
+                        mbytes[pos] = 0
+
+        dirty = QtCore.QRect(x0, y0, (x1 - x0 + 1), (y1 - y0 + 1))
+        self.update_layer_overlay(layer, dirty)
 
     def on_probe_radius_changed(self, v: int):
         self.probe_radius = int(v)
@@ -902,54 +1022,52 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
             return
 
         r = self.probe_radius
-        # Sample categories: compute % of pixels in radius that belong to each category mask
-        results = []
-        total = 0
+        if r <= 0:
+            return
 
-        # pre-load masks
-        masks = []
-        for c in layer.categories:
-            b64 = layer.category_masks.get(c.id)
-            if not b64:
-                continue
-            img = png_base64_to_qimage(b64)
-            if img.isNull():
-                continue
-            masks.append((c, img.convertToFormat(QtGui.QImage.Format_RGBA8888)))
+        mask = self.ensure_layer_index_mask(layer)
+        mbytes = self._qimage_bytes(mask)
+        bpl = mask.bytesPerLine()
 
-        # circle bounds
+        # index -> name
+        idx_to_name = {c.index: c.name for c in layer.categories}
+
         x0 = max(0, x - r)
         x1 = min(self.project.image_width - 1, x + r)
         y0 = max(0, y - r)
         y1 = min(self.project.image_height - 1, y + r)
+        rr = r * r
 
-        counts = {c.id: 0 for c, _ in masks}
+        total = 0
+        counts: Dict[int, int] = {}
 
         for yy in range(y0, y1 + 1):
             dy = yy - y
+            row = yy * bpl
             for xx in range(x0, x1 + 1):
                 dx = xx - x
-                if dx * dx + dy * dy > r * r:
+                if dx * dx + dy * dy > rr:
                     continue
                 total += 1
-                for c, img in masks:
-                    a = QtGui.QColor(img.pixel(xx, yy)).alpha()
-                    if a > 10:
-                        counts[c.id] += 1
+                idx = int(mbytes[row + xx])
+                if idx != 0:
+                    counts[idx] = counts.get(idx, 0) + 1
 
+        results = []
         if total > 0:
-            for c, _img in masks:
-                pct = (counts[c.id] / total) * 100.0
+            for idx, cnt in counts.items():
+                pct = (cnt / total) * 100.0
+                name = idx_to_name.get(idx, f"Unknown({idx})")
                 if pct > 0.2:
-                    results.append((pct, c.name))
+                    results.append((pct, name))
             results.sort(reverse=True)
 
-        # Entities inside radius
+        # Entities inside radius (unchanged)
         ents_in = []
         for e in layer.entities:
             dx = e.x - x
             dy = e.y - y
-            if dx * dx + dy * dy <= r * r:
+            if dx * dx + dy * dy <= rr:
                 ents_in.append(e.name)
 
         lines = [f"Probe @ ({x},{y}) r={r}px"]
@@ -982,40 +1100,55 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         self.rebuild_entities()
 
     # ---------- Overlay + entity rendering ----------
+    def _qimage_bytes(self, img: QtGui.QImage) -> memoryview:
+        """
+        Return a writable view of the QImage pixel buffer.
+
+        PySide6 sometimes returns a memoryview directly; sometimes a pointer-like
+        object that needs setsize(). Handle both.
+        """
+        ptr = img.bits()
+
+        # Case 1: already a memoryview
+        if isinstance(ptr, memoryview):
+            return ptr
+
+        # Case 2: pointer-like (needs setsize)
+        try:
+            ptr.setsize(img.sizeInBytes())
+        except AttributeError:
+            # Fallback: try to coerce to memoryview
+            return memoryview(ptr)
+
+        return memoryview(ptr)
+
+    def _category_lut_rgba(self, layer: Layer) -> List[bytes]:
+        # lut[idx] = 4 bytes RGBA for that category index
+        lut = [b"\x00\x00\x00\x00"] * 256
+        for c in layer.categories:
+            r, g, b, a = c.color
+            lut[c.index] = bytes((r, g, b, a))
+        return lut
+
     def rebuild_overlays(self):
-        # Remove all overlay items and re-add for current layer only
-        for key, item in list(self.overlay_items.items()):
+        # remove previous overlay items
+        for _lid, item in list(self.layer_overlay_items.items()):
             self.scene.removeItem(item)
-        self.overlay_items.clear()
+        self.layer_overlay_items.clear()
 
         layer = self.current_layer()
         if not layer or not self.project.image_path:
             return
 
-        # Z order: base image 0, overlays 10.., entities 100..
-        z = 10
-        for cat in layer.categories:
-            b64 = layer.category_masks.get(cat.id)
-            if not b64:
-                continue
-            img = png_base64_to_qimage(b64)
-            if img.isNull():
-                continue
-            pm = QtGui.QPixmap.fromImage(img)
-            item = self.scene.addPixmap(pm)
-            item.setZValue(z)
-            item.setOpacity(0.55)
-            item.setPos(0, 0)
-            self.overlay_items[(layer.id, cat.id)] = item
-            z += 1
+        # build full overlay from index mask
+        self.ensure_layer_index_mask(layer)
+        overlay = self.ensure_layer_overlay_image(layer)
 
-    def update_overlay_for(self, layer_id: str, category_id: str, mask_img: QtGui.QImage):
-        key = (layer_id, category_id)
-        if key in self.overlay_items:
-            self.overlay_items[key].setPixmap(QtGui.QPixmap.fromImage(mask_img))
-            return
-        # if overlay didn't exist yet, rebuild overlays for layer
-        self.rebuild_overlays()
+        # full refresh
+        overlay.fill(QtGui.QColor(0, 0, 0, 0))
+        full = QtCore.QRect(0, 0, self.project.image_width, self.project.image_height)
+        self.update_layer_overlay(layer, full)
+
 
     def rebuild_entities(self):
         # remove previous entity items
@@ -1065,10 +1198,31 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
                 name=ld["name"],
                 categories=[],
                 entities=[],
-                category_masks=dict(ld.get("category_masks", {})),
+                #category_masks=dict(ld.get("category_masks", {})),
+                mask_index_png_b64=ld.get("mask_index_png_b64"),
             )
+
+            # Assign indices if missing (older files)
+            used = set()
+            next_idx = 1
+
             for cd in ld.get("categories", []):
-                layer.categories.append(Category(id=cd["id"], name=cd["name"], color=tuple(cd["color"])))
+                idx = cd.get("index")
+                if idx is None:
+                    while next_idx in used and next_idx < 256:
+                        next_idx += 1
+                    idx = next_idx
+                used.add(int(idx))
+
+                layer.categories.append(
+                    Category(
+                        id=cd["id"],
+                        name=cd["name"],
+                        color=tuple(cd["color"]),
+                        index=int(idx),
+                    )
+                )
+
             for ed in ld.get("entities", []):
                 layer.entities.append(
                     Entity(
@@ -1107,7 +1261,15 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
             path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save project JSON", "", "JSON (*.json)")
         if not path:
             return
+
+        # Encode runtime masks to PNG b64 once at save time
+        for layer in self.project.layers:
+            img = getattr(layer, "mask_index_img", None)
+            if isinstance(img, QtGui.QImage) and not img.isNull():
+                layer.mask_index_png_b64 = qimage_to_png_base64(img.convertToFormat(QtGui.QImage.Format_Grayscale8))
+
         data = self.project_to_dict()
+
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         self.persist_last_project_path(path)
@@ -1135,7 +1297,7 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
             if not img.isNull():
                 self.scene.clear()
                 self.ensure_preview_ring()
-                self.overlay_items.clear()
+                self.layer_overlay_items.clear()
                 self.entity_items.clear()
                 self.base_pixmap_item = self.scene.addPixmap(QtGui.QPixmap.fromImage(img))
                 self.base_pixmap_item.setZValue(0)
@@ -1145,7 +1307,7 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         else:
             self.scene.clear()
             self.ensure_preview_ring()
-            self.overlay_items.clear()
+            self.layer_overlay_items.clear()
             self.entity_items.clear()
             self.base_pixmap_item = None
 
