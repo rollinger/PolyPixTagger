@@ -504,11 +504,10 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         self.canvas.resetTransform()
         self.canvas.fitInView(self.scene.sceneRect(), QtCore.Qt.KeepAspectRatio)
 
-        # ensure existing layers have masks initialized
+        # ensure each layer has an index mask (blank if none)
         for layer in self.project.layers:
-            for cat in layer.categories:
-                if cat.id not in layer.category_masks:
-                    layer.category_masks[cat.id] = None
+            self.ensure_layer_index_mask(layer)
+
         self.rebuild_overlays()
         self.rebuild_entities()
 
@@ -575,9 +574,7 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
             return
 
         cat = Category(id=new_id(), name=name, color=qcolor_to_rgba_tuple(c), index=idx)
-
         layer.categories.append(cat)
-        layer.category_masks.setdefault(cat.id, None)
 
         self.refresh_category_list(select_id=cat.id)
         self.rebuild_overlays()
@@ -592,8 +589,6 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         deleted_index = deleted.index if deleted else None
 
         layer.categories = [c for c in layer.categories if c.id != cid]
-        if cid in layer.category_masks:
-            del layer.category_masks[cid]
 
         if deleted_index is not None and self.project.image_path:
             mask = self.ensure_layer_index_mask(layer)
@@ -1198,7 +1193,6 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
                 name=ld["name"],
                 categories=[],
                 entities=[],
-                #category_masks=dict(ld.get("category_masks", {})),
                 mask_index_png_b64=ld.get("mask_index_png_b64"),
             )
 
