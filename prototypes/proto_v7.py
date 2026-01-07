@@ -234,8 +234,9 @@ class AppState(QtCore.QObject):
         self.erase_mode = "erase_all"  # erase_all | erase_only_category | erase_all_but_category
 
         # Point tool params
-        self.point_default_radius = 0.0      # dot radius in scene coords
+        self.point_default_radius = 1.0      # dot radius in scene coords
         self.point_default_rgba = [0, 0, 0, 255]
+        self.point_default_kv: Dict[str, str] = {}
 
         # Point tool runtime drag state
         self._point_drag_active = False
@@ -1012,7 +1013,7 @@ class VectorRenderer:
                 if d.radius and d.radius > 0.0:
                     rr = float(d.radius)
                     rad = QtWidgets.QGraphicsEllipseItem(d.x - rr, d.y - rr, rr * 2, rr * 2)
-                    pen2 = QtGui.QPen(dot_color, 1.5)  # hairline
+                    pen2 = QtGui.QPen(dot_color, 2.5)  # bold hairline
                     pen2.setCosmetic(True)  # stays thin at any zoom
                     rad.setPen(pen2)
                     rad.setBrush(QtCore.Qt.NoBrush)
@@ -1314,6 +1315,95 @@ class ImageCanvas(QtWidgets.QGraphicsView):
 
         super().mouseReleaseEvent(event)
 
+class KeyValueTable(QtWidgets.QWidget):
+    changed = QtCore.Signal()
+
+    def __init__(self, parent=None, value_only_keys: Optional[set[str]] = None):
+        super().__init__(parent)
+        self.value_only_keys = value_only_keys or set()
+
+        self.table = QtWidgets.QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["Key", "Value"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+
+        self.btn_add = QtWidgets.QPushButton("Add")
+        self.btn_del = QtWidgets.QPushButton("Remove")
+
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(self.btn_add)
+        row.addWidget(self.btn_del)
+        row.addStretch(1)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.table, 1)
+        layout.addLayout(row)
+
+        self.btn_add.clicked.connect(self._on_add)
+        self.btn_del.clicked.connect(self._on_del)
+        self.table.itemChanged.connect(lambda _it: self.changed.emit())
+
+    def set_dict(self, d: Dict[str, object]):
+        self.table.blockSignals(True)
+        self.table.setRowCount(0)
+
+        # stable ordering
+        for k in sorted(d.keys()):
+            self._append_row(str(k), "" if d[k] is None else str(d[k]))
+
+        self._apply_value_only_rules()
+        self.table.blockSignals(False)
+
+    def get_dict(self) -> Dict[str, str]:
+        out: Dict[str, str] = {}
+        for r in range(self.table.rowCount()):
+            k_item = self.table.item(r, 0)
+            v_item = self.table.item(r, 1)
+            if not k_item:
+                continue
+            k = (k_item.text() or "").strip()
+            if not k:
+                continue
+            v = "" if not v_item else (v_item.text() or "")
+            out[k] = v
+        return out
+
+    def _append_row(self, key: str, value: str):
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+
+        it_k = QtWidgets.QTableWidgetItem(key)
+        it_v = QtWidgets.QTableWidgetItem(value)
+
+        self.table.setItem(r, 0, it_k)
+        self.table.setItem(r, 1, it_v)
+
+    def _apply_value_only_rules(self):
+        for r in range(self.table.rowCount()):
+            k_item = self.table.item(r, 0)
+            if not k_item:
+                continue
+            k = (k_item.text() or "").strip()
+            if k in self.value_only_keys:
+                # key not editable
+                k_item.setFlags(k_item.flags() & ~QtCore.Qt.ItemIsEditable)
+
+    def _on_add(self):
+        self.table.blockSignals(True)
+        self._append_row("key", "")
+        self._apply_value_only_rules()
+        self.table.blockSignals(False)
+        self.changed.emit()
+
+    def _on_del(self):
+        r = self.table.currentRow()
+        if r >= 0:
+            self.table.removeRow(r)
+            self.changed.emit()
+
 
 class RightPanel(QtWidgets.QWidget):
     """Pure UI widget; emits signals and exposes widgets to controller."""
@@ -1327,7 +1417,7 @@ class RightPanel(QtWidgets.QWidget):
     deleteCategoryClicked = QtCore.Signal()
 
     deleteEntityClicked = QtCore.Signal()
-    applyEntityPropsClicked = QtCore.Signal()
+    applyEntityEditorClicked = QtCore.Signal()
 
     pointColorClicked = QtCore.Signal()
 
@@ -1338,9 +1428,6 @@ class RightPanel(QtWidgets.QWidget):
         self.category_list = QtWidgets.QListWidget()
         self.entity_list = QtWidgets.QListWidget()
 
-        self.props_editor = QtWidgets.QPlainTextEdit()
-        self.props_editor.setPlaceholderText('Entity properties JSON (e.g. {"type":"forest","owner":"..."} )')
-
         # tooling
         self.tool_stack = QtWidgets.QStackedWidget()
         self.spin_brush = QtWidgets.QSpinBox()
@@ -1348,10 +1435,27 @@ class RightPanel(QtWidgets.QWidget):
         self.spin_erase = QtWidgets.QSpinBox()
         self.combo_erase_mode = QtWidgets.QComboBox()
 
-        # point tool params
+        # Point tooling defaults (seed ent.data for new points)
+        self.point_defaults_kv = KeyValueTable()
+
+        # Entity editor (selected only)
+        self.ent_name = QtWidgets.QLineEdit()
+        self.ent_desc = QtWidgets.QLineEdit()
+        self.ent_x = QtWidgets.QDoubleSpinBox()
+        self.ent_y = QtWidgets.QDoubleSpinBox()
+        self.ent_r = QtWidgets.QDoubleSpinBox()
+
+        for sp in (self.ent_x, self.ent_y):
+            sp.setRange(-1e9, 1e9)
+            sp.setDecimals(3)
+
+        self.ent_r.setRange(0.0, 1e9)
+        self.ent_r.setDecimals(3)
+
+        self.ent_kv = KeyValueTable()  # ent.data editor
+
         self.spin_point_radius = QtWidgets.QDoubleSpinBox()
         self.btn_point_color = QtWidgets.QPushButton("Pick dot color...")
-
 
         self._build_ui()
 
@@ -1410,6 +1514,16 @@ class RightPanel(QtWidgets.QWidget):
         point_layout.addRow("Default data", self.edit_point_data)
         point_layout.addRow(self.btn_point_color)
         self.btn_point_color.clicked.connect(self.pointColorClicked.emit)
+
+        # Point defaults page
+        # point_page = QtWidgets.QWidget()
+        # point_layout = QtWidgets.QVBoxLayout(point_page)
+        # point_layout.setContentsMargins(0, 0, 0, 0)
+        point_layout.addWidget(QtWidgets.QLabel("Default Data for NEW points (ent.data):"))
+        point_layout.addWidget(self.point_defaults_kv)
+        # point_layout.addWidget(self.point_defaults_kv, 1)
+
+        # self.tool_stack.addWidget(point_page)  # 4
 
         # Empty page
         empty_page = QtWidgets.QWidget()
@@ -1480,12 +1594,26 @@ class RightPanel(QtWidgets.QWidget):
         layout.addLayout(rowCE)
         layout.addSpacing(6)
 
-        # Props
-        layout.addWidget(QtWidgets.QLabel("Selected entity properties (JSON)"))
-        layout.addWidget(self.props_editor, 2)
-        btn_apply_props = QtWidgets.QPushButton("Apply entity JSON")
-        btn_apply_props.clicked.connect(self.applyEntityPropsClicked.emit)
-        layout.addWidget(btn_apply_props)
+        # Entity editor
+        ent_box = QtWidgets.QGroupBox("Selected Entity (Point) Editor")
+        ent_l = QtWidgets.QVBoxLayout(ent_box)
+
+        form = QtWidgets.QFormLayout()
+        form.addRow("Name", self.ent_name)
+        form.addRow("Description", self.ent_desc)
+        form.addRow("x", self.ent_x)
+        form.addRow("y", self.ent_y)
+        form.addRow("r (radius)", self.ent_r)
+        ent_l.addLayout(form)
+
+        ent_l.addWidget(QtWidgets.QLabel("Custom Data (ent.data):"))
+        ent_l.addWidget(self.ent_kv, 1)
+
+        btn_apply = QtWidgets.QPushButton("Apply selected entity changes")
+        btn_apply.clicked.connect(self.applyEntityEditorClicked.emit)
+        ent_l.addWidget(btn_apply)
+
+        layout.addWidget(ent_box, 2)
 
 
 # ============================================================
@@ -1596,7 +1724,8 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         self.right.deleteCategoryClicked.connect(self.delete_category)
 
         self.right.deleteEntityClicked.connect(self.delete_entity)
-        self.right.applyEntityPropsClicked.connect(self.apply_entity_props)
+        self.right.applyEntityEditorClicked.connect(self.apply_entity_editor)
+        self.right.point_defaults_kv.changed.connect(self._on_point_defaults_changed)
 
         # Tooling controls -> state
         self.right.spin_probe.valueChanged.connect(self._on_probe_radius_changed)
@@ -1764,7 +1893,9 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         self.refresh_tool_ui()
         self.refresh_scene_for_selection()
         self.update_selection_label()
-        self._update_props_editor_from_selection()  # NEW
+        if self.state.tool_mode == "entity_point":
+            self.right.point_defaults_kv.set_dict(self.state.point_default_kv)
+        self._update_entity_editor_from_selection()
 
     def _update_props_editor_from_selection(self):
         layer = self.current_layer()
@@ -1778,6 +1909,81 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
             return
         self.right.props_editor.setPlainText(json.dumps(ent.data, indent=2, ensure_ascii=False))
 
+    def _update_entity_editor_from_selection(self):
+        layer = self.current_layer()
+        eid = self.state.current_entity_id
+
+        # disable if nothing selected
+        widgets = [self.right.ent_name, self.right.ent_desc, self.right.ent_x, self.right.ent_y, self.right.ent_r]
+        for w in widgets:
+            w.setEnabled(bool(layer and eid))
+        self.right.ent_kv.setEnabled(bool(layer and eid))
+
+        if not layer or not eid:
+            self.right.ent_name.setText("")
+            self.right.ent_desc.setText("")
+            self.right.ent_x.setValue(0.0)
+            self.right.ent_y.setValue(0.0)
+            self.right.ent_r.setValue(0.0)
+            self.right.ent_kv.set_dict({})
+            return
+
+        ent = next((e for e in layer.entities if e.id == eid), None)
+        if not ent or not ent.dots:
+            return
+
+        d0 = ent.dots[0]
+
+        # block signals to avoid accidental state writes
+        self.right.ent_name.blockSignals(True)
+        self.right.ent_desc.blockSignals(True)
+        self.right.ent_x.blockSignals(True)
+        self.right.ent_y.blockSignals(True)
+        self.right.ent_r.blockSignals(True)
+
+        self.right.ent_name.setText(ent.name or "")
+        self.right.ent_desc.setText(ent.description or "")
+        self.right.ent_x.setValue(float(d0.x))
+        self.right.ent_y.setValue(float(d0.y))
+        self.right.ent_r.setValue(float(d0.radius or 0.0))
+
+        self.right.ent_name.blockSignals(False)
+        self.right.ent_desc.blockSignals(False)
+        self.right.ent_x.blockSignals(False)
+        self.right.ent_y.blockSignals(False)
+        self.right.ent_r.blockSignals(False)
+
+        self.right.ent_kv.set_dict(ent.data if isinstance(ent.data, dict) else {})
+
+    def apply_entity_editor(self):
+        layer = self.current_layer()
+        eid = self.state.current_entity_id
+        if not layer or not eid:
+            return
+
+        ent = next((e for e in layer.entities if e.id == eid), None)
+        if not ent or not ent.dots:
+            return
+
+        if ent.type != "point":
+            self.status.showMessage("Entity editor currently supports points only.", 1500)
+            return
+
+        d0 = ent.dots[0]
+
+        # fixed fields -> attributes
+        ent.name = self.right.ent_name.text().strip()
+        ent.description = self.right.ent_desc.text().strip()
+        d0.x = float(self.right.ent_x.value())
+        d0.y = float(self.right.ent_y.value())
+        d0.radius = float(self.right.ent_r.value())
+
+        # kv table -> ent.data
+        ent.data = self.right.ent_kv.get_dict()
+
+        # visuals + lists
+        self.rebuild_entities()
+        self.state.notify_project_changed()
 
     def refresh_tool_ui(self):
         mode = self.state.tool_mode
@@ -1947,6 +2153,8 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         item.setData(QtCore.Qt.UserRole, eid)
         return item
 
+    def _on_point_defaults_changed(self):
+        self.state.point_default_kv = self.right.point_defaults_kv.get_dict()
 
     # ---------------- selection item handlers ----------------
 
@@ -2345,16 +2553,7 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
             name = f"Point {n}"
 
         # Default entity data (JSON) from toolbox
-        data = {}
-        if getattr(self.right, "edit_point_data", None):
-            txt = self.right.edit_point_data.toPlainText().strip()
-            if txt:
-                try:
-                    data = json.loads(txt)
-                    if not isinstance(data, dict):
-                        data = {}
-                except Exception:
-                    data = {}
+        data = dict(self.state.point_default_kv),  # <-- seed here
 
         ent = EntityBase(
             id=new_id(),
