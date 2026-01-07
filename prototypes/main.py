@@ -1,4 +1,4 @@
-from proto_v5 import main as main_v5
+from proto_v6 import main as prototype
 
 if __name__ == "__main__":
-    main_v5()
+    prototype()
