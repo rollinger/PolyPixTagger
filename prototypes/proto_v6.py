@@ -706,6 +706,187 @@ class EditService:
 
         return deleted_index
 
+# ============================================================
+# Undo / Redo (tile-based mask edits)
+# ============================================================
+
+class _StrokeMaskRecorder:
+    """
+    Records original bytes for tiles touched during a stroke, and can later
+    snapshot "after" bytes for the same tiles.
+    """
+    def __init__(self, tile_size: int = 128):
+        self.tile = int(tile_size)
+        self.layer_id: Optional[str] = None
+        self.tiles_before: Dict[Tuple[int, int], bytes] = {}
+        self.tiles_rect: Dict[Tuple[int, int], QtCore.QRect] = {}
+        self.dirty_union: Optional[QtCore.QRect] = None
+
+    def begin(self, layer_id: str):
+        self.layer_id = layer_id
+        self.tiles_before.clear()
+        self.tiles_rect.clear()
+        self.dirty_union = None
+
+    def is_active(self) -> bool:
+        return self.layer_id is not None
+
+    def _tile_rect(self, tx: int, ty: int, w: int, h: int) -> QtCore.QRect:
+        x = tx * self.tile
+        y = ty * self.tile
+        return clamp_rect_to_image(QtCore.QRect(x, y, self.tile, self.tile), w, h)
+
+    @staticmethod
+    def _copy_rect_bytes(mask: QtGui.QImage, rect: QtCore.QRect) -> bytes:
+        """Copy Grayscale8 pixels of rect into packed bytes (rect.w * rect.h)."""
+        rect = rect.normalized()
+        if rect.isEmpty():
+            return b""
+
+        bpl = mask.bytesPerLine()
+        mv = OverlayRenderer.qimage_bytes(mask)
+
+        out = bytearray(rect.width() * rect.height())
+        out_i = 0
+
+        for yy in range(rect.top(), rect.bottom() + 1):
+            row = yy * bpl
+            start = row + rect.left()
+            end = start + rect.width()
+            out[out_i:out_i + rect.width()] = mv[start:end]
+            out_i += rect.width()
+
+        return bytes(out)
+
+    @staticmethod
+    def _write_rect_bytes(mask: QtGui.QImage, rect: QtCore.QRect, data: bytes) -> None:
+        rect = rect.normalized()
+        if rect.isEmpty():
+            return
+        bpl = mask.bytesPerLine()
+        mv = OverlayRenderer.qimage_bytes(mask)
+
+        w = rect.width()
+        expected = w * rect.height()
+        if len(data) != expected:
+            raise ValueError(f"rect bytes length mismatch: got {len(data)} expected {expected}")
+
+        i = 0
+        for yy in range(rect.top(), rect.bottom() + 1):
+            row = yy * bpl
+            start = row + rect.left()
+            mv[start:start + w] = data[i:i + w]
+            i += w
+
+    def capture_before_for_rect(self, mask: QtGui.QImage, rect: QtCore.QRect, img_w: int, img_h: int):
+        """
+        Capture BEFORE bytes for any tiles overlapped by rect, but only once per tile.
+        Must be called BEFORE you modify the mask in those tiles.
+        """
+        rect = clamp_rect_to_image(rect, img_w, img_h)
+        if rect.isEmpty():
+            return
+
+        # Update union (used for overlay refresh)
+        self.dirty_union = rect if self.dirty_union is None else self.dirty_union.united(rect)
+
+        t = self.tile
+        tx0 = rect.left() // t
+        tx1 = rect.right() // t
+        ty0 = rect.top() // t
+        ty1 = rect.bottom() // t
+
+        for ty in range(ty0, ty1 + 1):
+            for tx in range(tx0, tx1 + 1):
+                key = (tx, ty)
+                if key in self.tiles_before:
+                    continue
+                tr = self._tile_rect(tx, ty, img_w, img_h)
+                self.tiles_rect[key] = tr
+                self.tiles_before[key] = self._copy_rect_bytes(mask, tr)
+
+    def build_command(self, mask: QtGui.QImage, get_layer_fn, overlay, img_w: int, img_h: int):
+        """
+        Create an undo command from captured tiles. Returns None if nothing changed.
+        """
+        if not self.is_active() or not self.tiles_before:
+            return None
+
+        tiles_after: Dict[Tuple[int, int], bytes] = {}
+        any_change = False
+        for key, before in self.tiles_before.items():
+            tr = self.tiles_rect[key]
+            after = self._copy_rect_bytes(mask, tr)
+            tiles_after[key] = after
+            if after != before:
+                any_change = True
+
+        if not any_change:
+            return None
+
+        dirty = self.dirty_union or QtCore.QRect(0, 0, img_w, img_h)
+        dirty = clamp_rect_to_image(dirty, img_w, img_h)
+
+        return MaskTilesUndoCommand(
+            layer_id=self.layer_id,
+            tiles_rect=self.tiles_rect.copy(),
+            tiles_before=self.tiles_before.copy(),
+            tiles_after=tiles_after,
+            dirty_rect=dirty,
+            get_layer_fn=get_layer_fn,
+            overlay=overlay,
+        )
+
+
+class MaskTilesUndoCommand(QtGui.QUndoCommand):
+    """
+    Undo/Redo for a stroke: restores tile bytes (before/after).
+    """
+    def __init__(
+        self,
+        layer_id: str,
+        tiles_rect: Dict[Tuple[int, int], QtCore.QRect],
+        tiles_before: Dict[Tuple[int, int], bytes],
+        tiles_after: Dict[Tuple[int, int], bytes],
+        dirty_rect: QtCore.QRect,
+        get_layer_fn,
+        overlay: "OverlayRenderer",
+        description: str = "Stroke",
+    ):
+        super().__init__(description)
+        self.layer_id = layer_id
+        self.tiles_rect = tiles_rect
+        self.tiles_before = tiles_before
+        self.tiles_after = tiles_after
+        self.dirty_rect = dirty_rect
+        self.get_layer_fn = get_layer_fn
+        self.overlay = overlay
+
+    def _apply(self, which: str):
+        layer = self.get_layer_fn(self.layer_id)
+        if not layer:
+            return
+
+        # Ensure mask exists
+        mask = self.overlay.mask_store.ensure_layer_index_mask(layer)
+
+        # Apply tiles
+        for key, tr in self.tiles_rect.items():
+            data = self.tiles_before[key] if which == "before" else self.tiles_after[key]
+            _StrokeMaskRecorder._write_rect_bytes(mask, tr, data)
+
+        # Refresh overlay pixels + flush pixmap immediately (undo should feel instant)
+        self.overlay.update_layer_overlay(layer, self.dirty_rect)
+        self.overlay.flush_now(layer)
+
+    def undo(self):
+        self._apply("before")
+
+    def redo(self):
+        self._apply("after")
+
+
+
 
 # ============================================================
 # Views
@@ -989,6 +1170,10 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         self.overlay = OverlayRenderer(self.state, self.mask_store, self.scene)
         self.editor = EditService(self.state, self.mask_store, self.overlay)
 
+        # Undo stack
+        self.undo_stack = QtGui.QUndoStack(self)
+        self._stroke_rec = _StrokeMaskRecorder(tile_size=128)
+
         # Right panel
         self.right = RightPanel()
 
@@ -1147,6 +1332,14 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         self.act_quit.setShortcut(QtGui.QKeySequence.Quit)
         self.act_quit.triggered.connect(self.confirm_quit)
 
+        # Undo/Redo actions (Ctrl+Z / Ctrl+Y)
+        self.act_undo = self.undo_stack.createUndoAction(self, "Undo")
+        self.act_undo.setShortcut(QtGui.QKeySequence.Undo)
+
+        self.act_redo = self.undo_stack.createRedoAction(self, "Redo")
+        self.act_redo.setShortcut(QtGui.QKeySequence.Redo)
+
+
         # Tools
         self.act_pan = QtGui.QAction("Pan", self, checkable=True)
         self.act_pan.setShortcut(QtGui.QKeySequence("Ctrl+M"))
@@ -1178,12 +1371,18 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         m_file.addAction(self.act_save_as)
         m_file.addSeparator()
         m_file.addAction(self.act_quit)
+        m_edit = self.menuBar().addMenu("Edit")
+        m_edit.addAction(self.act_undo)
+        m_edit.addAction(self.act_redo)
 
         # Toolbar
         toolbar = self.addToolBar("Tools")
         toolbar.setMovable(False)
         toolbar.addAction(self.act_load)
         toolbar.addAction(self.act_quick_save)
+        toolbar.addSeparator()
+        toolbar.addAction(self.act_undo)
+        toolbar.addAction(self.act_redo)
         toolbar.addSeparator()
 
         group = QtGui.QActionGroup(self)
@@ -1662,6 +1861,12 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
             self.status.showMessage("Select a category for this erase mode.", 1500)
             return
 
+        layer = self.current_layer()
+        if not layer:
+            return
+
+        self._stroke_rec.begin(layer.id)
+
         self._stroke_active = True
         self._stroke_last = (ix, iy)
 
@@ -1686,8 +1891,33 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         self._stroke_last = (ix, iy)
 
     def on_stroke_ended(self, x: float, y: float):
+        # finalize undo record (if any)
+        if self._stroke_rec.is_active():
+            p = self.state.project
+            layer = self.current_layer()
+            if layer and layer.id == self._stroke_rec.layer_id and p.image_path:
+                mask = self.mask_store.ensure_layer_index_mask(layer)
+                cmd = self._stroke_rec.build_command(
+                    mask=mask,
+                    get_layer_fn=self._get_layer_by_id,
+                    overlay=self.overlay,
+                    img_w=p.image_width,
+                    img_h=p.image_height,
+                )
+                if cmd is not None:
+                    self.undo_stack.push(cmd)
+
+            # stop recording
+            self._stroke_rec.layer_id = None
+
         self._stroke_active = False
         self._stroke_last = None
+
+    def _get_layer_by_id(self, layer_id: str) -> Optional[Layer]:
+        for l in self.state.project.layers:
+            if l.id == layer_id:
+                return l
+        return None
 
     def _apply_stroke_segment(self, x0: int, y0: int, x1: int, y1: int):
         p = self.state.project
@@ -1732,6 +1962,16 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         bpl = mask.bytesPerLine()
 
         dirty_union = None
+
+        # If recording, capture "before" for the tiles this segment could touch
+        if self._stroke_rec.is_active() and self._stroke_rec.layer_id == layer.id:
+            seg_rect = QtCore.QRect(
+                min(x0, x1) - r,
+                min(y0, y1) - r,
+                abs(x1 - x0) + 2 * r + 1,
+                abs(y1 - y0) + 2 * r + 1,
+            )
+            self._stroke_rec.capture_before_for_rect(mask, seg_rect, p.image_width, p.image_height)
 
         if mode == "brush":
             cat = next((c for c in layer.categories if c.id == self.state.current_category_id), None)
