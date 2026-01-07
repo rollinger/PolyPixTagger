@@ -234,8 +234,6 @@ class AppState(QtCore.QObject):
         self.erase_mode = "erase_all"  # erase_all | erase_only_category | erase_all_but_category
 
         # Point tool params
-        self.point_create_on_click = True
-        self.point_hit_tol_px = 10           # selection tolerance in screen pixels
         self.point_default_radius = 0.0      # dot radius in scene coords
         self.point_default_rgba = [0, 0, 0, 255]
 
@@ -1014,7 +1012,7 @@ class VectorRenderer:
                 if d.radius and d.radius > 0.0:
                     rr = float(d.radius)
                     rad = QtWidgets.QGraphicsEllipseItem(d.x - rr, d.y - rr, rr * 2, rr * 2)
-                    pen2 = QtGui.QPen(dot_color, 0.0)  # hairline
+                    pen2 = QtGui.QPen(dot_color, 1.5)  # hairline
                     pen2.setCosmetic(True)  # stays thin at any zoom
                     rad.setPen(pen2)
                     rad.setBrush(QtCore.Qt.NoBrush)
@@ -1211,9 +1209,9 @@ class MaskTilesUndoCommand(QtGui.QUndoCommand):
 
 class ImageCanvas(QtWidgets.QGraphicsView):
     mouseMoved = QtCore.Signal(float, float)   # scene coords
-    mouseClicked = QtCore.Signal(float, float)  # scene coords
+    mouseClicked = QtCore.Signal(float, float, QtCore.Qt.KeyboardModifiers) # detect ctrl+click
 
-    strokeStarted = QtCore.Signal(float, float)
+    strokeStarted = QtCore.Signal(float, float, QtCore.Qt.KeyboardModifiers)
     strokeMoved = QtCore.Signal(float, float)
     strokeEnded = QtCore.Signal(float, float)
 
@@ -1264,9 +1262,9 @@ class ImageCanvas(QtWidgets.QGraphicsView):
 
         if event.button() == QtCore.Qt.LeftButton:
             p = self.mapToScene(event.position().toPoint())
-            self.strokeStarted.emit(p.x(), p.y())
-            # keep old click signal if you want single-click tools (probe/entity)
-            self.mouseClicked.emit(p.x(), p.y())
+            mods = event.modifiers()
+            self.strokeStarted.emit(p.x(), p.y(), mods)
+            self.mouseClicked.emit(p.x(), p.y(), mods)
 
         if event.button() == QtCore.Qt.LeftButton and self.dragMode() == QtWidgets.QGraphicsView.ScrollHandDrag:
             self.viewport().setCursor(QtCore.Qt.ClosedHandCursor)
@@ -1328,7 +1326,6 @@ class RightPanel(QtWidgets.QWidget):
     renameCategoryClicked = QtCore.Signal()
     deleteCategoryClicked = QtCore.Signal()
 
-    addEntityClicked = QtCore.Signal()
     deleteEntityClicked = QtCore.Signal()
     applyEntityPropsClicked = QtCore.Signal()
 
@@ -1352,8 +1349,6 @@ class RightPanel(QtWidgets.QWidget):
         self.combo_erase_mode = QtWidgets.QComboBox()
 
         # point tool params
-        self.chk_point_create = QtWidgets.QCheckBox("Create new point on click")
-        self.spin_point_tol = QtWidgets.QSpinBox()
         self.spin_point_radius = QtWidgets.QDoubleSpinBox()
         self.btn_point_color = QtWidgets.QPushButton("Pick dot color...")
 
@@ -1399,9 +1394,6 @@ class RightPanel(QtWidgets.QWidget):
         point_layout = QtWidgets.QFormLayout(point_page)
         point_layout.setContentsMargins(0, 0, 0, 0)
 
-        self.spin_point_tol.setRange(1, 100)
-        self.spin_point_tol.setValue(10)
-
         self.spin_point_radius.setRange(0.0, 10_000.0)
         self.spin_point_radius.setDecimals(2)
         self.spin_point_radius.setSingleStep(1.0)
@@ -1413,8 +1405,6 @@ class RightPanel(QtWidgets.QWidget):
         self.edit_point_data.setPlaceholderText('Default entity data JSON (dict), e.g. {"type":"tree","id":123}')
         self.edit_point_data.setFixedHeight(80)
 
-        point_layout.addRow(self.chk_point_create)
-        point_layout.addRow("Hit tolerance (px)", self.spin_point_tol)
         point_layout.addRow("Dot radius (scene)", self.spin_point_radius)
         point_layout.addRow("Default name", self.edit_point_name)
         point_layout.addRow("Default data", self.edit_point_data)
@@ -1453,33 +1443,41 @@ class RightPanel(QtWidgets.QWidget):
         layout.addLayout(rowL)
         layout.addSpacing(6)
 
-        # Categories
-        layout.addWidget(QtWidgets.QLabel("Categories (per layer)"))
-        layout.addWidget(self.category_list, 1)
-        rowC = QtWidgets.QHBoxLayout()
-        btn_add_cat = QtWidgets.QPushButton("Add category")
-        btn_ren_cat = QtWidgets.QPushButton("Rename category")
-        btn_del_cat = QtWidgets.QPushButton("Delete category")
+        # --- Categories + Entities side by side ---
+        rowCE = QtWidgets.QHBoxLayout()
+        rowCE.setSpacing(8)
+
+        # Categories box
+        boxC = QtWidgets.QGroupBox("Categories (per layer)")
+        layC = QtWidgets.QVBoxLayout(boxC)
+        layC.addWidget(self.category_list, 1)
+
+        rowCbtn = QtWidgets.QHBoxLayout()
+        btn_add_cat = QtWidgets.QPushButton("Add")
+        btn_ren_cat = QtWidgets.QPushButton("Rename")
+        btn_del_cat = QtWidgets.QPushButton("Delete")
         btn_add_cat.clicked.connect(self.addCategoryClicked.emit)
         btn_ren_cat.clicked.connect(self.renameCategoryClicked.emit)
         btn_del_cat.clicked.connect(self.deleteCategoryClicked.emit)
-        rowC.addWidget(btn_add_cat)
-        rowC.addWidget(btn_ren_cat)
-        rowC.addWidget(btn_del_cat)
-        layout.addLayout(rowC)
-        layout.addSpacing(6)
+        rowCbtn.addWidget(btn_add_cat)
+        rowCbtn.addWidget(btn_ren_cat)
+        rowCbtn.addWidget(btn_del_cat)
+        layC.addLayout(rowCbtn)
 
-        # Entities
-        layout.addWidget(QtWidgets.QLabel("Entities (per layer)"))
-        layout.addWidget(self.entity_list, 1)
-        rowE = QtWidgets.QHBoxLayout()
-        btn_add_ent = QtWidgets.QPushButton("Add entity (point)")
-        btn_del_ent = QtWidgets.QPushButton("Delete entity")
-        btn_add_ent.clicked.connect(self.addEntityClicked.emit)
+        # Entities box
+        boxE = QtWidgets.QGroupBox("Entities (per layer)")
+        layE = QtWidgets.QVBoxLayout(boxE)
+        layE.addWidget(self.entity_list, 1)
+
+        rowEbtn = QtWidgets.QHBoxLayout()
+        btn_del_ent = QtWidgets.QPushButton("Delete")
         btn_del_ent.clicked.connect(self.deleteEntityClicked.emit)
-        rowE.addWidget(btn_add_ent)
-        rowE.addWidget(btn_del_ent)
-        layout.addLayout(rowE)
+        rowEbtn.addWidget(btn_del_ent)
+        layE.addLayout(rowEbtn)
+
+        rowCE.addWidget(boxC, 1)
+        rowCE.addWidget(boxE, 1)
+        layout.addLayout(rowCE)
         layout.addSpacing(6)
 
         # Props
@@ -1597,13 +1595,12 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         self.right.renameCategoryClicked.connect(self.rename_category)
         self.right.deleteCategoryClicked.connect(self.delete_category)
 
-        self.right.addEntityClicked.connect(self.add_entity)
         self.right.deleteEntityClicked.connect(self.delete_entity)
         self.right.applyEntityPropsClicked.connect(self.apply_entity_props)
 
         # Tooling controls -> state
-        self.right.spin_brush.valueChanged.connect(self._on_brush_radius_changed)
         self.right.spin_probe.valueChanged.connect(self._on_probe_radius_changed)
+        self.right.spin_brush.valueChanged.connect(self._on_brush_radius_changed)
         self.right.spin_erase.valueChanged.connect(self._on_erase_radius_changed)
         self.right.combo_erase_mode.currentIndexChanged.connect(self._on_erase_mode_changed)
 
@@ -1613,8 +1610,6 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         self.state.projectChanged.connect(self.refresh_ui_from_state)
 
         # Point tool controls -> state / edit
-        self.right.chk_point_create.toggled.connect(self._on_point_create_toggled)
-        self.right.spin_point_tol.valueChanged.connect(self._on_point_tol_changed)
         self.right.spin_point_radius.valueChanged.connect(self._on_point_radius_changed)
         self.right.pointColorClicked.connect(self._on_point_color_clicked)
 
@@ -1806,8 +1801,6 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         self.right.spin_probe.blockSignals(True)
         self.right.spin_erase.blockSignals(True)
         self.right.combo_erase_mode.blockSignals(True)
-        self.right.chk_point_create.blockSignals(True)
-        self.right.spin_point_tol.blockSignals(True)
         self.right.spin_point_radius.blockSignals(True)
 
         self.right.spin_brush.setValue(int(self.state.brush_radius))
@@ -1818,8 +1811,6 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         mode_to_idx = {"erase_all": 0, "erase_only_category": 1, "erase_all_but_category": 2}
         self.right.combo_erase_mode.setCurrentIndex(mode_to_idx.get(self.state.erase_mode, 0))
 
-        self.right.chk_point_create.setChecked(bool(self.state.point_create_on_click))
-        self.right.spin_point_tol.setValue(int(self.state.point_hit_tol_px))
 
         # radius: show selected dot radius if possible, else default
         radius_val = float(self.state.point_default_radius)
@@ -1839,8 +1830,6 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         self.right.spin_probe.blockSignals(False)
         self.right.spin_erase.blockSignals(False)
         self.right.combo_erase_mode.blockSignals(False)
-        self.right.chk_point_create.blockSignals(False)
-        self.right.spin_point_tol.blockSignals(False)
         self.right.spin_point_radius.blockSignals(False)
 
         # cursor + drag mode
@@ -2067,7 +2056,7 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         self.lbl_pos.setText(f"x: {x:.1f}, y: {y:.1f}")
         self.update_tool_preview_ring(x, y)
 
-    def on_mouse_clicked(self, x: float, y: float):
+    def on_mouse_clicked(self, x: float, y: float, mods: QtCore.Qt.KeyboardModifiers):
         p = self.state.project
         if not p.image_path:
             return
@@ -2107,17 +2096,24 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
             return
 
         if mode == "entity_point":
-            tol_scene = self._scene_tol_from_px(float(self.state.point_hit_tol_px))
-
-            # 1) If we hit something: select it (dot if hit). DO NOT move on click.
-            eid_hit, dot_hit = self.editor.hit_test_entity(float(x), float(y), tol_scene)
-            if eid_hit:
-                self.state.set_entity(eid_hit)
-                self.state.set_dot(dot_hit)
+            layer = self.current_layer()
+            if not layer:
                 return
 
-            # 2) Empty space: if create enabled -> create new point and select it
-            if self.state.point_create_on_click:
+            tol_scene = self._point_tol_scene()
+
+            # ALT+click deletes point under cursor
+            if mods & QtCore.Qt.AltModifier:
+                eid, dot_id = self.editor.hit_test_entity(float(x), float(y), tol_scene)
+                if eid:
+                    self._delete_entity_and_select_neighbor(eid)
+                    self.state.notify_project_changed()
+                    return
+                self.status.showMessage("No point under cursor to delete.", 1200)
+                return
+
+            # CTRL+click adds a new point at cursor
+            if mods & QtCore.Qt.ControlModifier:
                 new_eid = self._create_point_entity_at(float(x), float(y))
                 if new_eid:
                     self.state.set_entity(new_eid)
@@ -2126,8 +2122,11 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
                     self.state.notify_project_changed()
                 return
 
-            # 3) Otherwise do nothing
-            self.status.showMessage("Click near a point to select it (or enable 'Create new point on click').", 2000)
+            # Plain click: select only (drag handled by strokeStarted/moved)
+            eid, dot_id = self.editor.hit_test_entity(float(x), float(y), tol_scene)
+            if eid:
+                self.state.set_entity(eid)
+                self.state.set_dot(dot_id)
             return
 
     # ---------------- model helpers ----------------
@@ -2299,12 +2298,10 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         self.state.set_tool("entity_point")
 
     def delete_entity(self):
-        layer = self.current_layer()
         eid = self.state.current_entity_id
-        if not layer or not eid:
+        if not eid:
             return
-        layer.entities = [e for e in layer.entities if e.id != eid]
-        self.state.set_entity(None)
+        self._delete_entity_and_select_neighbor(eid)
         self.state.notify_project_changed()
 
     def apply_entity_props(self):
@@ -2329,6 +2326,12 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Invalid JSON", str(ex))
 
     # ---------------- Point Vector ----------------
+
+    def _point_tol_scene(self) -> float:
+        # 10 px in screen space → scene space
+        return self._scene_tol_from_px(10.0)
+
+
     def _create_point_entity_at(self, x: float, y: float) -> Optional[str]:
         layer = self.current_layer()
         if not layer:
@@ -2376,7 +2379,7 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
 
     # ---------------- Stroke Interpolation ----------------
 
-    def on_stroke_started(self, x: float, y: float):
+    def on_stroke_started(self, x: float, y: float, mods: QtCore.Qt.KeyboardModifiers):
         p = self.state.project
         if not p.image_path:
             return
@@ -2384,6 +2387,21 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         ix, iy = int(x), int(y)
 
         mode = self.state.tool_mode
+
+        if mode == "entity_point":
+            # never start drag on ctrl/alt (those are add/delete)
+            if (mods & QtCore.Qt.ControlModifier) or (mods & QtCore.Qt.AltModifier):
+                return
+
+            tol_scene = self._point_tol_scene()
+            eid_hit, dot_hit = self.editor.hit_test_entity(float(x), float(y), tol_scene)
+            if eid_hit:
+                self.state.set_entity(eid_hit)
+                self.state.set_dot(dot_hit)
+                self.state._point_drag_active = True
+            else:
+                self.state._point_drag_active = False
+            return
 
         # Tools that should NOT continuously draw
         if mode in ("probe", "pan"):
@@ -2675,6 +2693,28 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
             return float(tol_px)
         return float(tol_px) / float(sx)
 
+    def _delete_entity_and_select_neighbor(self, eid: str):
+        layer = self.current_layer()
+        if not layer:
+            return
+
+        # find index of eid in list
+        idx = next((i for i, e in enumerate(layer.entities) if e.id == eid), None)
+        if idx is None:
+            return
+
+        # delete
+        layer.entities.pop(idx)
+
+        # choose next selection: same index if exists else previous
+        if not layer.entities:
+            self.state.set_entity(None)
+            self.state.set_dot(None)
+            return
+
+        new_idx = idx if idx < len(layer.entities) else len(layer.entities) - 1
+        self.state.set_entity(layer.entities[new_idx].id)
+        self.state.set_dot(None)
 
     # ---------------- import / scene ----------------
 
