@@ -224,6 +224,7 @@ class AppState(QtCore.QObject):
         self.current_layer_id: Optional[str] = None
         self.current_category_id: Optional[str] = None
         self.current_entity_id: Optional[str] = None
+        self.current_dot_id: Optional[str] = None
 
         # Tool state
         self.tool_mode = "pan"  # pan | probe | brush | erase | entity_point
@@ -239,6 +240,7 @@ class AppState(QtCore.QObject):
         self.current_layer_id = layer_id
         self.current_category_id = None
         self.current_entity_id = None
+        self.current_dot_id = None
         self.selectionChanged.emit()
 
     def set_category(self, category_id: Optional[str]):
@@ -251,6 +253,13 @@ class AppState(QtCore.QObject):
         if self.current_entity_id == entity_id:
             return
         self.current_entity_id = entity_id
+        self.current_dot_id = None
+        self.selectionChanged.emit()
+
+    def set_dot(self, dot_id: Optional[str]):
+        if self.current_dot_id == dot_id:
+            return
+        self.current_dot_id = dot_id
         self.selectionChanged.emit()
 
     # ----- tool helpers -----
@@ -693,17 +702,131 @@ class EditService:
             results.sort(reverse=True)
 
         ents_in = []
+        r_scene = float(r)
+        r2 = r_scene * r_scene
+
         for e in layer.entities:
             if not e.dots:
                 continue
-            # For now: treat entity proximity using first dot
-            d0 = e.dots[0]
-            dx = d0.x - x
-            dy = d0.y - y
-            if dx * dx + dy * dy <= rr:
+
+            best_d2 = None
+
+            # dot distances
+            for d in e.dots:
+                d2 = self._dist2_point(x, y, d.x, d.y)
+                best_d2 = d2 if best_d2 is None else min(best_d2, d2)
+
+            # segment distances (line/polygon)
+            if len(e.dots) >= 2:
+                pts = e.dots
+                for i in range(len(pts) - 1):
+                    a = pts[i]
+                    b = pts[i + 1]
+                    d2 = self._dist2_point_to_segment(x, y, a.x, a.y, b.x, b.y)
+                    best_d2 = d2 if best_d2 is None else min(best_d2, d2)
+
+                is_poly = (e.type == "polygon") or bool(e.closed)
+                if is_poly and len(pts) >= 3:
+                    a = pts[-1]
+                    b = pts[0]
+                    d2 = self._dist2_point_to_segment(x, y, a.x, a.y, b.x, b.y)
+                    best_d2 = d2 if best_d2 is None else min(best_d2, d2)
+
+            if best_d2 is not None and best_d2 <= r2:
                 ents_in.append(e.name)
 
         return results, ents_in
+
+    # ---- geometry / hit test ----
+
+    @staticmethod
+    def _dist2_point(ax: float, ay: float, bx: float, by: float) -> float:
+        dx = ax - bx
+        dy = ay - by
+        return dx * dx + dy * dy
+
+    @staticmethod
+    def _dist2_point_to_segment(px: float, py: float, ax: float, ay: float, bx: float, by: float) -> float:
+        # Project point P onto segment AB and clamp t to [0, 1]
+        abx = bx - ax
+        aby = by - ay
+        apx = px - ax
+        apy = py - ay
+
+        denom = abx * abx + aby * aby
+        if denom <= 1e-12:
+            # A and B are the same
+            return (px - ax) ** 2 + (py - ay) ** 2
+
+        t = (apx * abx + apy * aby) / denom
+        if t < 0.0:
+            t = 0.0
+        elif t > 1.0:
+            t = 1.0
+
+        cx = ax + t * abx
+        cy = ay + t * aby
+        dx = px - cx
+        dy = py - cy
+        return dx * dx + dy * dy
+
+    def hit_test_entity(self, x: float, y: float, tol_scene: float) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Returns (entity_id, dot_id) if hit.
+        dot_id is set when a dot is hit; otherwise dot_id is None when only a segment hit.
+        """
+        layer = self.current_layer()
+        if not layer or tol_scene <= 0:
+            return None, None
+
+        tol2 = tol_scene * tol_scene
+
+        best_eid = None
+        best_dot = None
+        best_d2 = None
+
+        # 1) prefer dot hits
+        for e in layer.entities:
+            for d in e.dots:
+                d2 = self._dist2_point(x, y, d.x, d.y)
+                if d2 <= tol2 and (best_d2 is None or d2 < best_d2):
+                    best_d2 = d2
+                    best_eid = e.id
+                    best_dot = d.id
+
+        if best_eid is not None:
+            return best_eid, best_dot
+
+        # 2) then segment hits (line/polygon)
+        for e in layer.entities:
+            if len(e.dots) < 2:
+                continue
+
+            pts = e.dots
+            n = len(pts)
+
+            # segments between consecutive points
+            for i in range(n - 1):
+                a = pts[i]
+                b = pts[i + 1]
+                d2 = self._dist2_point_to_segment(x, y, a.x, a.y, b.x, b.y)
+                if d2 <= tol2 and (best_d2 is None or d2 < best_d2):
+                    best_d2 = d2
+                    best_eid = e.id
+                    best_dot = None
+
+            # closing segment for polygon
+            is_poly = (e.type == "polygon") or bool(e.closed)
+            if is_poly and n >= 3:
+                a = pts[-1]
+                b = pts[0]
+                d2 = self._dist2_point_to_segment(x, y, a.x, a.y, b.x, b.y)
+                if d2 <= tol2 and (best_d2 is None or d2 < best_d2):
+                    best_d2 = d2
+                    best_eid = e.id
+                    best_dot = None
+
+        return best_eid, best_dot
 
     # ---- entity placement ----
     def place_entity_point(self, x: int, y: int) -> bool:
@@ -734,11 +857,6 @@ class EditService:
         layer.categories = [c for c in layer.categories if c.id != category_id]
         self.overlay.invalidate_lut(layer)
 
-        # Detach entities from that category
-        for e in layer.entities:
-            if e.category_id == category_id:
-                e.category_id = None
-
         if deleted_index is None or not p.image_path:
             return deleted_index
 
@@ -751,6 +869,115 @@ class EditService:
                 mbytes[i] = 0
 
         return deleted_index
+
+class VectorRenderer:
+    """
+    Renders EntityBase + Dot as QGraphicsItems (handles, segments, radius circles).
+    Handles are cosmetic (screen-sized). Radius circles are scene-sized.
+    """
+
+    def __init__(self, scene: QtWidgets.QGraphicsScene):
+        self.scene = scene
+        self._items_by_entity: Dict[str, QtWidgets.QGraphicsItem] = {}
+
+    def clear(self):
+        for _eid, item in list(self._items_by_entity.items()):
+            self.scene.removeItem(item)
+        self._items_by_entity.clear()
+
+    @staticmethod
+    def _rgba_from_dot(d: Dot) -> Tuple[int, int, int, int]:
+        rgba = d.data.get("rgba") if isinstance(d.data, dict) else None
+        if isinstance(rgba, list) and len(rgba) == 4:
+            try:
+                return (int(rgba[0]), int(rgba[1]), int(rgba[2]), int(rgba[3]))
+            except Exception:
+                pass
+        return (0, 0, 0, 255)
+
+    def rebuild(
+        self,
+        layer: Optional[Layer],
+        selected_entity_id: Optional[str],
+        selected_dot_id: Optional[str],
+    ):
+        self.clear()
+        if not layer:
+            return
+
+        for e in layer.entities:
+            if not e.dots:
+                continue
+
+            is_selected_entity = (e.id == selected_entity_id)
+            group = QtWidgets.QGraphicsItemGroup()
+            group.setZValue(9000)
+            self.scene.addItem(group)
+            self._items_by_entity[e.id] = group
+
+            # Styling
+            color_entity = QtGui.QColor(40, 120, 255, 220)   # blue
+            color_dot_sel = QtGui.QColor(255, 60, 60, 230)   # red
+            color_faint = QtGui.QColor(0, 0, 0, 140)
+
+            # --- segments ---
+            if len(e.dots) >= 2 and e.type in ("line", "polygon"):
+                path = QtGui.QPainterPath(QtCore.QPointF(e.dots[0].x, e.dots[0].y))
+                for d in e.dots[1:]:
+                    path.lineTo(d.x, d.y)
+
+                # polygon closure
+                is_poly = (e.type == "polygon") or bool(e.closed)
+                if is_poly and len(e.dots) >= 3:
+                    path.lineTo(e.dots[0].x, e.dots[0].y)
+
+                item_path = QtWidgets.QGraphicsPathItem(path)
+                pen = QtGui.QPen(color_entity if is_selected_entity else color_faint, 1)
+                pen.setCosmetic(True)
+                item_path.setPen(pen)
+                item_path.setBrush(QtCore.Qt.NoBrush)
+                item_path.setZValue(9001)
+                group.addToGroup(item_path)
+
+            # --- dots (handles + radius circles) ---
+            for d in e.dots:
+                is_sel_dot = (d.id == selected_dot_id) and is_selected_entity
+                rgba = self._rgba_from_dot(d)
+                dot_color = rgba_tuple_to_qcolor(rgba)
+
+                # handle: small cosmetic marker (always visible)
+                handle_r = 4.0
+                handle = QtWidgets.QGraphicsEllipseItem(d.x - handle_r, d.y - handle_r, handle_r * 2, handle_r * 2)
+
+                pen = QtGui.QPen(color_dot_sel if is_sel_dot else (color_entity if is_selected_entity else QtGui.QColor(0, 0, 0, 180)), 1)
+                pen.setCosmetic(True)
+                handle.setPen(pen)
+
+                fill = dot_color if not is_selected_entity else QtGui.QColor(255, 255, 255, 180)
+                handle.setBrush(QtGui.QBrush(fill))
+                handle.setZValue(9002)
+                group.addToGroup(handle)
+
+                # radius: true-size circle in scene coords if radius > 0
+                if d.radius and d.radius > 0.0:
+                    rr = float(d.radius)
+                    rad = QtWidgets.QGraphicsEllipseItem(d.x - rr, d.y - rr, rr * 2, rr * 2)
+                    pen2 = QtGui.QPen(dot_color, 1)
+                    pen2.setCosmetic(False)  # scene-sized circle
+                    rad.setPen(pen2)
+                    rad.setBrush(QtCore.Qt.NoBrush)
+                    rad.setOpacity(0.35 if not is_selected_entity else 0.55)
+                    rad.setZValue(9001)
+                    group.addToGroup(rad)
+
+            # label (keep it faint)
+            d0 = e.dots[0]
+            label = QtWidgets.QGraphicsSimpleTextItem(e.name)
+            label.setBrush(QtGui.QBrush(QtGui.QColor(0, 0, 0, 180)))
+            label.setPos(d0.x + 8, d0.y - 10)
+            label.setZValue(9003)
+            group.addToGroup(label)
+
 
 # ============================================================
 # Undo / Redo (tile-based mask edits)
@@ -1216,6 +1443,9 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         self.overlay = OverlayRenderer(self.state, self.mask_store, self.scene)
         self.editor = EditService(self.state, self.mask_store, self.overlay)
 
+        # Vector Rendering
+        self.vectors = VectorRenderer(self.scene)
+
         # Undo stack
         self.undo_stack = QtGui.QUndoStack(self)
         self.undo_stack.setUndoLimit(200)
@@ -1614,6 +1844,7 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
     def _on_entity_item_changed(self, current: Optional[QtWidgets.QListWidgetItem], _prev):
         eid = current.data(QtCore.Qt.UserRole) if current else None
         self.state.set_entity(eid)
+        self.state.set_dot(None) # New entity selected, no dot selected
 
         # update props editor
         layer = self.current_layer()
@@ -1689,10 +1920,24 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
             return
 
         if mode == "entity_point":
-            if not self.editor.place_entity_point(int(x), int(y)):
-                self.status.showMessage("Select an entity, then click to place it.", 2000)
+            # If an entity is selected, place/move its first dot
+            if self.state.current_entity_id:
+                if not self.editor.place_entity_point(int(x), int(y)):
+                    self.status.showMessage("Select an entity, then click to place it.", 2000)
+                    return
+                self.rebuild_entities()
                 return
-            self.rebuild_entities()
+
+            # Otherwise: click near existing geometry to select it (hit test)
+            tol_scene = self._scene_tol_from_px(10.0)
+            eid, dot_id = self.editor.hit_test_entity(float(x), float(y), tol_scene)
+            if eid:
+                self.state.set_entity(eid)
+                self.state.set_dot(dot_id)
+                # rebuild happens via selectionChanged -> refresh_ui_from_state
+                return
+
+            self.status.showMessage("No entity selected. Select one in the list or click near one.", 2000)
             return
 
     # ---------------- model helpers ----------------
@@ -1888,7 +2133,7 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
             return
 
         try:
-            ent.props = json.loads(text)
+            ent.data = json.loads(text)
             self.state.notify_project_changed()
         except Exception as ex:
             QtWidgets.QMessageBox.warning(self, "Invalid JSON", str(ex))
@@ -2129,39 +2374,25 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
     # ---------------- entity rendering ----------------
 
     def rebuild_entities(self):
-        # Remove old
-        if not hasattr(self, "_entity_items"):
-            self._entity_items: Dict[str, QtWidgets.QGraphicsItem] = {}
-        for _eid, item in list(self._entity_items.items()):
-            self.scene.removeItem(item)
-        self._entity_items.clear()
-
         layer = self.current_layer()
         p = self.state.project
         if not layer or not p.image_path:
+            self.vectors.clear()
             return
 
-        for e in layer.entities:
-            if not e.dots:
-                continue
-            d0 = e.dots[0]
-            group = QtWidgets.QGraphicsItemGroup()
-            r = 5
-            circle = QtWidgets.QGraphicsEllipseItem(d0.x - r, d0.y - r, r * 2, r * 2)
-            circle.setBrush(QtGui.QBrush(QtGui.QColor(255, 255, 255, 220)))
-            circle.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0, 180), 1))
-            circle.setZValue(100)
+        self.vectors.rebuild(
+            layer=layer,
+            selected_entity_id=self.state.current_entity_id,
+            selected_dot_id=getattr(self.state, "current_dot_id", None),
+        )
 
-            label = QtWidgets.QGraphicsSimpleTextItem(e.name)
-            label.setBrush(QtGui.QBrush(QtGui.QColor(0, 0, 0, 200)))
-            label.setPos(d0.x + 8, d0.y - 10)
-            label.setZValue(101)
+    def _scene_tol_from_px(self, tol_px: float) -> float:
+        # assume uniform scaling
+        sx = self.canvas.transform().m11()
+        if sx <= 1e-9:
+            return float(tol_px)
+        return float(tol_px) / float(sx)
 
-            group.addToGroup(circle)
-            group.addToGroup(label)
-            group.setZValue(100)
-            self.scene.addItem(group)
-            self._entity_items[e.id] = group
 
     # ---------------- import / scene ----------------
 

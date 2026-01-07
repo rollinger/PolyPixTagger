@@ -58,3 +58,7 @@ B) Tool implementation
 3) Lets implement the Point tool (Display, Param, Create, Edit)
 4) lets implement the Line tool (Display, Param, Create, Edit)
 5) lets implement the Polygon tool (Display, Param, Create, Edit)
+
+
+Are we ready for step 3? If yes: Lets implement the Point tool (Display, Param, Create, Edit)
+Here is the current state of prototype v7 as the basis for the next patch.
