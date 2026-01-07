@@ -1,12 +1,13 @@
 I want to implement Point, Line and Polygon. Here is an outline of the requirements for the three tools.
+
 A) Datastructure
-- Point, Line and Poligon are composed of Dots and are called Entity.
+- Point, Line and Polygon are composed of Dots and are called an entity of a kind.
 - An entity is stored at the layer level in a list.
 - A Dot itself has x,y,radius, optional name, optional json data (k,v). 
 - - x,y,r are floats and can be finer grained than a pixel of the image. 
 - - The radius can be 0 being a true point (default)
 - - a dot itself can have name, but is empty per default
-- - the dot data contains {"rgba": [255,255,255,255]} indicating the default color black
+- - the dot data contains {"rgba": [255,255,255,255]} indicating the default color black (solid)
 - An Entity (Point, Line and Polygon) has a required name and optional description and optional json data (k,v)
 - EntityPoint: Single Dot.
 - EntityLine: Start Dot, End Dot and list of Path Dots in between (can all be in a list)
