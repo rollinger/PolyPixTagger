@@ -85,6 +85,10 @@ class ImageCanvas(QtWidgets.QGraphicsView):
         )
         self.setDragMode(QtWidgets.QGraphicsView.NoDrag)
         self.setTransformationAnchor(QtWidgets.QGraphicsView.AnchorUnderMouse)
+        # Middle Mouse Btn Panning (all tools)
+        self._mm_panning = False
+        self._saved_drag_mode = self.dragMode()
+        self._saved_cursor = None
 
     def wheelEvent(self, event: QtGui.QWheelEvent):
         if event.modifiers() & QtCore.Qt.ControlModifier:
@@ -95,23 +99,73 @@ class ImageCanvas(QtWidgets.QGraphicsView):
             return
         super().wheelEvent(event)
 
+    def mousePressEvent(self, event: QtGui.QMouseEvent):
+        # --- Middle mouse: always pan ---
+        if event.button() == QtCore.Qt.MiddleButton:
+            self._mm_panning = True
+            self._saved_drag_mode = self.dragMode()
+            self._saved_cursor = self.viewport().cursor()
+            self.setDragMode(QtWidgets.QGraphicsView.ScrollHandDrag)
+            self.viewport().setCursor(QtCore.Qt.ClosedHandCursor)
+
+            # Fake a left-button press so ScrollHandDrag starts dragging immediately
+            fake = QtGui.QMouseEvent(
+                event.type(),
+                event.position(),
+                event.globalPosition(),
+                QtCore.Qt.LeftButton,
+                QtCore.Qt.LeftButton,
+                event.modifiers(),
+            )
+            super().mousePressEvent(fake)
+            event.accept()
+            return
+
+        # --- Existing left-click logic ---
+        if event.button() == QtCore.Qt.LeftButton:
+            p = self.mapToScene(event.position().toPoint())
+            self.mouseClicked.emit(p.x(), p.y())
+
+        if event.button() == QtCore.Qt.LeftButton and self.dragMode() == QtWidgets.QGraphicsView.ScrollHandDrag:
+            self.viewport().setCursor(QtCore.Qt.ClosedHandCursor)
+
+        super().mousePressEvent(event)
+
     def mouseMoveEvent(self, event: QtGui.QMouseEvent):
         p = self.mapToScene(event.position().toPoint())
         self.mouseMoved.emit(p.x(), p.y())
         super().mouseMoveEvent(event)
 
-    def mousePressEvent(self, event: QtGui.QMouseEvent):
-        if event.button() == QtCore.Qt.LeftButton:
-            p = self.mapToScene(event.position().toPoint())
-            self.mouseClicked.emit(p.x(), p.y())
-        if event.button() == QtCore.Qt.LeftButton and self.dragMode() == QtWidgets.QGraphicsView.ScrollHandDrag:
-            self.viewport().setCursor(QtCore.Qt.ClosedHandCursor)
-        super().mousePressEvent(event)
-
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent):
+        # --- Middle mouse: end pan ---
+        if event.button() == QtCore.Qt.MiddleButton and self._mm_panning:
+            # Fake left-button release to end ScrollHandDrag
+            fake = QtGui.QMouseEvent(
+                event.type(),
+                event.position(),
+                event.globalPosition(),
+                QtCore.Qt.LeftButton,
+                QtCore.Qt.NoButton,
+                event.modifiers(),
+            )
+            super().mouseReleaseEvent(fake)
+
+            self._mm_panning = False
+            self.setDragMode(self._saved_drag_mode)
+            if self._saved_cursor is not None:
+                self.viewport().setCursor(self._saved_cursor)
+            else:
+                self.viewport().unsetCursor()
+
+            event.accept()
+            return
+
+        # --- Existing pan-cursor restore for real pan tool ---
         if self.dragMode() == QtWidgets.QGraphicsView.ScrollHandDrag:
             self.viewport().setCursor(QtCore.Qt.OpenHandCursor)
+
         super().mouseReleaseEvent(event)
+
 
 class PixTagMainWindow(QtWidgets.QMainWindow):
     def __init__(self):
@@ -169,6 +223,7 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         self.btn_edit_layer = QtWidgets.QPushButton("Edit layer")
         self.btn_del_layer = QtWidgets.QPushButton("Delete layer")
         self.btn_add_cat = QtWidgets.QPushButton("Add category")
+        self.btn_rename_cat = QtWidgets.QPushButton("Rename category")
         self.btn_del_cat = QtWidgets.QPushButton("Delete category")
         self.btn_add_ent = QtWidgets.QPushButton("Add entity (point)")
         self.btn_del_ent = QtWidgets.QPushButton("Delete entity")
@@ -177,6 +232,7 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         self.btn_edit_layer.clicked.connect(self.edit_layer)
         self.btn_del_layer.clicked.connect(self.delete_layer)
         self.btn_add_cat.clicked.connect(self.add_category)
+        self.btn_rename_cat.clicked.connect(self.rename_category)
         self.btn_del_cat.clicked.connect(self.delete_category)
         self.btn_add_ent.clicked.connect(self.add_entity)
         self.btn_del_ent.clicked.connect(self.delete_entity)
@@ -265,6 +321,7 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         right_layout.addWidget(self.category_list, 1)
         rowC = QtWidgets.QHBoxLayout()
         rowC.addWidget(self.btn_add_cat)
+        rowC.addWidget(self.btn_rename_cat)
         rowC.addWidget(self.btn_del_cat)
         right_layout.addLayout(rowC)
         right_layout.addSpacing(6)
@@ -414,6 +471,7 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         # TODO
         self.act_entity_line = QtGui.QAction("Line", self, checkable=True)
         self.act_entity_line.setShortcut(QtGui.QKeySequence("Ctrl+L"))
+        # TODO
         self.act_entity_polygon = QtGui.QAction("Polygon", self, checkable=True)
         self.act_entity_polygon.setShortcut(QtGui.QKeySequence("Ctrl+O"))
 
@@ -580,6 +638,21 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         # No pixel data changed, only the LUT changed for future painting.
         # If you cache LUTs, refresh LUT cache here (optional).
         self.show_current_layer_overlay()  # or do nothing
+
+    def rename_category(self):
+        layer = self.current_layer()
+        if not layer or not self.current_category_id:
+            return
+
+        cid = self.current_category_id
+        category = next((c for c in layer.categories if c.id == cid), None)
+
+        name, ok = QtWidgets.QInputDialog.getText(self, "Rename category", "New Category name:", text=category.name)
+        if not ok or not name.strip():
+            return
+        new_name = name.strip()
+        category.name = new_name
+        self.refresh_category_list()
 
     def delete_category(self):
         layer = self.current_layer()
