@@ -6,14 +6,16 @@ A) Datastructure
 - An entity is stored at the layer level in a list.
 - A Dot itself has x,y,radius, optional name, optional json data (k,v). 
 - - x,y,r are floats and can be finer grained than a pixel of the image. 
-- - The radius can be > 1. 1 being a true pixel (default)
-- - radius bigger than 1 is a transparent circle.
+- - The radius can be > 0. 0 being a true cosmetic pixel (default)
+- - radius bigger than 0 is a transparent circle with that radius true to the image.
 - - a dot itself can have name, but is empty per default
-- - the dot data contains {"rgba": [255,255,255,255]} indicating the default color black (solid)
+- - the dot data contains {"rgba": [0,0,0,255]} indicating the default color black (solid)
 - An Entity (Point, Line and Polygon) has a required name and optional description and optional json data (k,v)
-- EntityPoint: Single Dot.
-- EntityLine: Start Dot, End Dot and list of Path Dots in between (can all be in a list)
-- EntityPolygon: OriginDot (start & end) and list of path dots (can all be in a list)
+- - Store as unified entity types EntityBase(type="point|line|polygon", id, name, description?, data?, dots=[Dot...], closed=False?)
+- - EntityPoint: Single Dot.
+- - EntityLine: Start Dot, End Dot and list of Path Dots in between (can all be in a list)
+- - EntityPolygon: OriginDot (start & end) and list of path dots (can all be in a list)
+- No migration from old datastructures needed (-> cold reset/wipe) no old project data with entities stored
 
 Currently the entity can be added via the Layer entity list. Now the list is for info/edit/delete purposes only.
 A new entity should be added via the toolbar (remove the add entity button from the Layer entity list).
@@ -28,15 +30,16 @@ B) Tool implementation
 - A selected entity is displayed blue; a selected dot is displayed red
 2) Parameterization
 - In the tool box some parameter can be preset, so click and add entities of one kind rapidly is possible 
-- Point: dot radius=0, dot color, entity name, entity json data
-- Line: dot radius=0, dot color, entity name, entity json data
-- Polygon: dot radius=0, dot color, entity name, entity json data
+- Point: dot radius=1, dot color: black, entity name, entity json data
+- Line: dot radius=1, dot color: black, entity name, entity json data
+- Polygon: dot radius=1, dot color: black, entity name, entity json data
 3) Create:
 - Select Point, Line, Polygon
 - Click to add point or start/origin of line/poligon
 - Point: Dialog: Set name, x,y,r and opt. entity description, and opt. json data
 - Line: continue click to add subsequent dots; a ctrl+click adds the end point -> Dialog set name, descr, data of entity
 - Polygon: continue click to add subsequent dots; a ctrl+click adds a last point -> Dialog set name, descr, data of entity
+- - Ctrl+click places final vertex and auto-close to origin.
 -> Save to Layer entity list & update layer.
 4) Edit
 - In the Layer entity list select the entity 
@@ -47,6 +50,7 @@ B) Tool implementation
 -- Alt+click on a dot: delete dot instant save & update layer)
 --- If the last dot was deleted in the entity, the entity is deleted (instant save & update layer)
 -- Ctrl+click on the map with a dot selected: insert dot after the selected dot. (instant save & update layer)
+5) Undo/redo integration
 
 ## Implementation plan
 First lets only implement the datastructures (Dot, EntityPoint, EntityLine, EntityPolygon) and the routines to insert/update the layer entity list.
