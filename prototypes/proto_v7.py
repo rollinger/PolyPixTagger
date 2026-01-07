@@ -57,13 +57,31 @@ class Category:
 
 
 @dataclass
-class Entity:
+class Dot:
     id: str
+    x: float
+    y: float
+    radius: float = 0.0  # 0 = cosmetic pixel handle; >0 = true-radius circle in image coords
+    name: str = ""
+    data: dict = field(default_factory=lambda: {"rgba": [0, 0, 0, 255]})  # default black solid
+
+
+@dataclass
+class EntityBase:
+    """
+    Unified vector entity.
+    type: "point" | "line" | "polygon"
+    dots: ordered list of dots
+    closed: only meaningful for polygon
+    """
+    id: str
+    type: str  # "point" | "line" | "polygon"
     name: str
-    category_id: Optional[str] = None
-    props: dict = field(default_factory=dict)
-    x: float = 0.0
-    y: float = 0.0
+    description: str = ""
+    data: dict = field(default_factory=dict)
+    dots: List[Dot] = field(default_factory=list)
+    closed: bool = False
+
 
 
 @dataclass
@@ -71,7 +89,7 @@ class Layer:
     id: str
     name: str
     categories: List[Category] = field(default_factory=list)
-    entities: List[Entity] = field(default_factory=list)
+    entities: List[EntityBase] = field(default_factory=list)
     # Persisted label map (Grayscale8) as PNG base64
     mask_index_png_b64: Optional[str] = None
     # Runtime caches (not in JSON)
@@ -137,14 +155,38 @@ class ProjectCodec:
                 )
 
             for ed in ld.get("entities", []):
+                # No migration required; we only accept the new schema.
+                etype = ed.get("type")
+                if etype not in ("point", "line", "polygon"):
+                    # ignore unknown/old entries
+                    continue
+
+                dots_in = []
+                for dd in ed.get("dots", []):
+                    try:
+                        dots_in.append(
+                            Dot(
+                                id=dd.get("id", new_id()),
+                                x=float(dd.get("x", 0.0)),
+                                y=float(dd.get("y", 0.0)),
+                                radius=float(dd.get("radius", 0.0)),
+                                name=str(dd.get("name", "")),
+                                data=dd.get("data", {"rgba": [0, 0, 0, 255]}),
+                            )
+                        )
+                    except Exception:
+                        # ignore malformed dot
+                        continue
+
                 layer.entities.append(
-                    Entity(
-                        id=ed["id"],
-                        name=ed["name"],
-                        category_id=ed.get("category_id"),
-                        props=ed.get("props", {}),
-                        x=float(ed.get("x", 0.0)),
-                        y=float(ed.get("y", 0.0)),
+                    EntityBase(
+                        id=ed.get("id", new_id()),
+                        type=etype,
+                        name=ed.get("name", "Unnamed"),
+                        description=str(ed.get("description", "")),
+                        data=ed.get("data", {}) or {},
+                        dots=dots_in,
+                        closed=bool(ed.get("closed", False)),
                     )
                 )
 
@@ -652,8 +694,12 @@ class EditService:
 
         ents_in = []
         for e in layer.entities:
-            dx = e.x - x
-            dy = e.y - y
+            if not e.dots:
+                continue
+            # For now: treat entity proximity using first dot
+            d0 = e.dots[0]
+            dx = d0.x - x
+            dy = d0.y - y
             if dx * dx + dy * dy <= rr:
                 ents_in.append(e.name)
 
@@ -665,10 +711,10 @@ class EditService:
         if not layer or not self.state.current_entity_id:
             return False
         ent = next((e for e in layer.entities if e.id == self.state.current_entity_id), None)
-        if not ent:
+        if not ent or not ent.dots:
             return False
-        ent.x = x
-        ent.y = y
+        ent.dots[0].x = float(x)
+        ent.dots[0].y = float(y)
         return True
 
     # ---- category deletion (v4 semantics: clear pixels for deleted index) ----
@@ -1146,7 +1192,7 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
 
         self.settings = QtCore.QSettings("PolyPixTagger", "PolyPixTagger")
 
-        self.setWindowTitle("PixTag Prototype v4 (Refactored)")
+        self.setWindowTitle("PixTag Prototype v7 (Polygon)")
         self.resize(1400, 900)
 
         # State
@@ -1508,14 +1554,8 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         self.right.entity_list.clear()
         if layer:
             for e in layer.entities:
-                label = e.name
-                if e.category_id:
-                    cat = next((c for c in layer.categories if c.id == e.category_id), None)
-                    if cat:
-                        label = f"{e.name}  [{cat.name}]"
-                item = QtWidgets.QListWidgetItem(label)
-                item.setData(QtCore.Qt.UserRole, e.id)
-                self.right.entity_list.addItem(item)
+                label = f"{e.name}  ({e.type})"
+                self.right.entity_list.addItem(self._entity_item(label, e.id))
         self.right.entity_list.blockSignals(False)
 
         self._select_list_item_by_id(self.right.entity_list, self.state.current_entity_id)
@@ -1554,6 +1594,13 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
                 listw.setCurrentRow(i)
                 return
 
+    @staticmethod
+    def _entity_item(text: str, eid: str) -> QtWidgets.QListWidgetItem:
+        item = QtWidgets.QListWidgetItem(text)
+        item.setData(QtCore.Qt.UserRole, eid)
+        return item
+
+
     # ---------------- selection item handlers ----------------
 
     def _on_layer_item_changed(self, current: Optional[QtWidgets.QListWidgetItem], _prev):
@@ -1573,7 +1620,7 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         if layer and eid:
             ent = next((e for e in layer.entities if e.id == eid), None)
             if ent:
-                self.right.props_editor.setPlainText(json.dumps(ent.props, indent=2, ensure_ascii=False))
+                self.right.props_editor.setPlainText(json.dumps(ent.data, indent=2, ensure_ascii=False))
 
     # ---------------- tool parameter handlers ----------------
 
@@ -1789,14 +1836,25 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         if not name:
             return
 
-        ent = Entity(
+        ent = EntityBase(
             id=new_id(),
+            type="point",
             name=name,
-            category_id=self.state.current_category_id,
-            props={},
-            x=self.state.project.image_width / 2 if self.state.project.image_width else 0,
-            y=self.state.project.image_height / 2 if self.state.project.image_height else 0,
+            description="",
+            data={},  # entity-level data (we’ll add UI later)
+            dots=[
+                Dot(
+                    id=new_id(),
+                    x=float(self.state.project.image_width / 2 if self.state.project.image_width else 0),
+                    y=float(self.state.project.image_height / 2 if self.state.project.image_height else 0),
+                    radius=0.0,
+                    name="",
+                    data={"rgba": [0, 0, 0, 255]},
+                )
+            ],
+            closed=False,
         )
+
         layer.entities.append(ent)
         self.state.set_entity(ent.id)
         self.state.notify_project_changed()
@@ -1825,7 +1883,7 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
 
         text = self.right.props_editor.toPlainText().strip()
         if not text:
-            ent.props = {}
+            ent.data = {}
             self.state.notify_project_changed()
             return
 
@@ -2084,16 +2142,19 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
             return
 
         for e in layer.entities:
+            if not e.dots:
+                continue
+            d0 = e.dots[0]
             group = QtWidgets.QGraphicsItemGroup()
             r = 5
-            circle = QtWidgets.QGraphicsEllipseItem(e.x - r, e.y - r, r * 2, r * 2)
+            circle = QtWidgets.QGraphicsEllipseItem(d0.x - r, d0.y - r, r * 2, r * 2)
             circle.setBrush(QtGui.QBrush(QtGui.QColor(255, 255, 255, 220)))
             circle.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0, 180), 1))
             circle.setZValue(100)
 
             label = QtWidgets.QGraphicsSimpleTextItem(e.name)
             label.setBrush(QtGui.QBrush(QtGui.QColor(0, 0, 0, 200)))
-            label.setPos(e.x + 8, e.y - 10)
+            label.setPos(d0.x + 8, d0.y - 10)
             label.setZValue(101)
 
             group.addToGroup(circle)

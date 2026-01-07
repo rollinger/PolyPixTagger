@@ -53,7 +53,8 @@ B) Tool implementation
 5) Undo/redo integration
 
 ## Implementation plan
-First lets only implement the datastructures (Dot, EntityPoint, EntityLine, EntityPolygon) and the routines to insert/update the layer entity list.
-Second lets implement the Point tool (Display, Param, Create, Edit)
-Third lets implement the Line tool (Display, Param, Create, Edit)
-Third lets implement the Polygon tool (Display, Param, Create, Edit)
+1) Lets only implement the datastructures (Dot, EntityPoint, EntityLine, EntityPolygon) and the routines to insert/update the layer entity list. datastructures + codec
+2) vector renderer + selection/hit-test + inspector plumbing
+3) Lets implement the Point tool (Display, Param, Create, Edit)
+4) lets implement the Line tool (Display, Param, Create, Edit)
+5) lets implement the Polygon tool (Display, Param, Create, Edit)
