@@ -715,6 +715,10 @@ class ImageCanvas(QtWidgets.QGraphicsView):
     mouseMoved = QtCore.Signal(float, float)   # scene coords
     mouseClicked = QtCore.Signal(float, float)  # scene coords
 
+    strokeStarted = QtCore.Signal(float, float)
+    strokeMoved = QtCore.Signal(float, float)
+    strokeEnded = QtCore.Signal(float, float)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMouseTracking(True)
@@ -762,6 +766,8 @@ class ImageCanvas(QtWidgets.QGraphicsView):
 
         if event.button() == QtCore.Qt.LeftButton:
             p = self.mapToScene(event.position().toPoint())
+            self.strokeStarted.emit(p.x(), p.y())
+            # keep old click signal if you want single-click tools (probe/entity)
             self.mouseClicked.emit(p.x(), p.y())
 
         if event.button() == QtCore.Qt.LeftButton and self.dragMode() == QtWidgets.QGraphicsView.ScrollHandDrag:
@@ -772,6 +778,13 @@ class ImageCanvas(QtWidgets.QGraphicsView):
     def mouseMoveEvent(self, event: QtGui.QMouseEvent):
         p = self.mapToScene(event.position().toPoint())
         self.mouseMoved.emit(p.x(), p.y())
+
+        # NEW: if left button is held, emit strokeMoved
+        if event.buttons() & QtCore.Qt.LeftButton:
+            # avoid interfering with middle-mouse panning
+            if not getattr(self, "_mm_panning", False):
+                self.strokeMoved.emit(p.x(), p.y())
+
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent):
@@ -795,6 +808,10 @@ class ImageCanvas(QtWidgets.QGraphicsView):
 
             event.accept()
             return
+
+        if event.button() == QtCore.Qt.LeftButton:
+            p = self.mapToScene(event.position().toPoint())
+            self.strokeEnded.emit(p.x(), p.y())
 
         if self.dragMode() == QtWidgets.QGraphicsView.ScrollHandDrag:
             self.viewport().setCursor(QtCore.Qt.OpenHandCursor)
@@ -1015,6 +1032,13 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
         # Canvas signals
         self.canvas.mouseMoved.connect(self.on_mouse_moved)
         self.canvas.mouseClicked.connect(self.on_mouse_clicked)
+
+        # Stroke interpolation
+        self.canvas.strokeStarted.connect(self.on_stroke_started)
+        self.canvas.strokeMoved.connect(self.on_stroke_moved)
+        self.canvas.strokeEnded.connect(self.on_stroke_ended)
+        self._stroke_active = False
+        self._stroke_last = None  # (x, y) in image coords
 
         # Right panel selection
         self.right.layer_list.currentItemChanged.connect(self._on_layer_item_changed)
@@ -1386,8 +1410,14 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
             return
 
         mode = self.state.tool_mode
+
+        if mode in ("brush", "erase"):
+            # handled by stroke (continuous)
+            return
+
         if mode == "pan":
             return
+
         if mode == "probe":
             results, ents = self.editor.probe_at(int(x), int(y))
             lines = [f"Probe @ ({int(x)},{int(y)}) r={self.state.probe_radius}px"]
@@ -1407,23 +1437,8 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
             return
 
         layer = self.current_layer()
+
         if not layer:
-            return
-
-        if mode == "brush":
-            dirty = self.editor.paint_at(int(x), int(y))
-            if dirty is None:
-                self.status.showMessage("Select a layer and a category to paint.", 2000)
-                return
-            self.overlay.update_layer_overlay(layer, dirty)
-            return
-
-        if mode == "erase":
-            dirty = self.editor.erase_at(int(x), int(y))
-            if dirty is None:
-                self.status.showMessage("Select a layer to erase (and category if needed).", 2000)
-                return
-            self.overlay.update_layer_overlay(layer, dirty)
             return
 
         if mode == "entity_point":
@@ -1619,6 +1634,198 @@ class PixTagMainWindow(QtWidgets.QMainWindow):
             self.state.notify_project_changed()
         except Exception as ex:
             QtWidgets.QMessageBox.warning(self, "Invalid JSON", str(ex))
+
+    # ---------------- Stroke Interpolation ----------------
+
+    def on_stroke_started(self, x: float, y: float):
+        p = self.state.project
+        if not p.image_path:
+            return
+
+        ix, iy = int(x), int(y)
+
+        mode = self.state.tool_mode
+
+        # Tools that should NOT continuously draw
+        if mode in ("probe", "entity_point", "pan"):
+            return
+
+        if not (0 <= ix < p.image_width and 0 <= iy < p.image_height):
+            return
+
+        if mode == "brush" and not self.state.current_category_id:
+            self.status.showMessage("Select a category to paint.", 1500)
+            return
+
+        if mode == "erase" and self.state.erase_mode in ("erase_only_category",
+                                                         "erase_all_but_category") and not self.state.current_category_id:
+            self.status.showMessage("Select a category for this erase mode.", 1500)
+            return
+
+        self._stroke_active = True
+        self._stroke_last = (ix, iy)
+
+        # First dab immediately
+        self._apply_stroke_segment(ix, iy, ix, iy)
+
+    def on_stroke_moved(self, x: float, y: float):
+        if not self._stroke_active:
+            return
+
+        p = self.state.project
+        ix, iy = int(x), int(y)
+
+        if not (0 <= ix < p.image_width and 0 <= iy < p.image_height):
+            return
+
+        lx, ly = self._stroke_last
+        if ix == lx and iy == ly:
+            return
+
+        self._apply_stroke_segment(lx, ly, ix, iy)
+        self._stroke_last = (ix, iy)
+
+    def on_stroke_ended(self, x: float, y: float):
+        self._stroke_active = False
+        self._stroke_last = None
+
+    def _apply_stroke_segment(self, x0: int, y0: int, x1: int, y1: int):
+        p = self.state.project
+        layer = self.current_layer()
+        if not layer or not p.image_path:
+            return
+
+        mode = self.state.tool_mode
+
+        # Determine tool radius
+        if mode == "brush":
+            r = int(self.state.brush_radius)
+        elif mode == "erase":
+            r = int(self.state.erase_radius)
+        else:
+            return
+
+        if r <= 0:
+            return
+
+        # Step size controls stroke density
+        step = max(1.0, r * 0.5)
+
+        dx = x1 - x0
+        dy = y1 - y0
+        dist = (dx * dx + dy * dy) ** 0.5
+
+        if dist == 0:
+            points = [(x0, y0)]
+        else:
+            n = max(1, int(dist / step))
+            points = []
+            for i in range(n + 1):
+                t = i / n
+                px = int(round(x0 + dx * t))
+                py = int(round(y0 + dy * t))
+                points.append((px, py))
+
+        # Get mask bytes once; apply many dabs
+        mask = self.mask_store.ensure_layer_index_mask(layer)
+        mbytes = self.overlay.qimage_bytes(mask)  # OverlayRenderer.qimage_bytes
+        bpl = mask.bytesPerLine()
+
+        dirty_union = None
+
+        if mode == "brush":
+            cat = next((c for c in layer.categories if c.id == self.state.current_category_id), None)
+            if not cat:
+                return
+            idx = int(cat.index)
+
+            for (px, py) in points:
+                dr = self._dab_set_index(mbytes, bpl, px, py, r, idx)
+                dirty_union = dr if dirty_union is None else dirty_union.united(dr)
+
+        elif mode == "erase":
+            erase_mode = self.state.erase_mode
+
+            selected_idx = None
+            if erase_mode in ("erase_only_category", "erase_all_but_category"):
+                cat = next((c for c in layer.categories if c.id == self.state.current_category_id), None)
+                if not cat:
+                    return
+                selected_idx = int(cat.index)
+
+            for (px, py) in points:
+                dr = self._dab_erase(mbytes, bpl, px, py, r, erase_mode, selected_idx)
+                dirty_union = dr if dirty_union is None else dirty_union.united(dr)
+
+        if dirty_union is None:
+            return
+
+        dirty_union = clamp_rect_to_image(dirty_union, p.image_width, p.image_height)
+
+        # Update overlay pixels once for the union rect
+        self.overlay.update_layer_overlay(layer, dirty_union)
+
+    def _dab_set_index(self, mbytes: memoryview, bpl: int, x: int, y: int, r: int, idx: int) -> QtCore.QRect:
+        p = self.state.project
+        w, h = p.image_width, p.image_height
+
+        x0 = max(0, x - r)
+        x1 = min(w - 1, x + r)
+        y0 = max(0, y - r)
+        y1 = min(h - 1, y + r)
+
+        rr = r * r
+        for yy in range(y0, y1 + 1):
+            dy = yy - y
+            row = yy * bpl
+            for xx in range(x0, x1 + 1):
+                dx = xx - x
+                if dx * dx + dy * dy <= rr:
+                    mbytes[row + xx] = idx
+
+        return QtCore.QRect(x0, y0, (x1 - x0 + 1), (y1 - y0 + 1))
+
+    def _dab_erase(
+            self,
+            mbytes: memoryview,
+            bpl: int,
+            x: int,
+            y: int,
+            r: int,
+            mode: str,
+            selected_idx: int | None,
+    ) -> QtCore.QRect:
+        p = self.state.project
+        w, h = p.image_width, p.image_height
+
+        x0 = max(0, x - r)
+        x1 = min(w - 1, x + r)
+        y0 = max(0, y - r)
+        y1 = min(h - 1, y + r)
+
+        rr = r * r
+        for yy in range(y0, y1 + 1):
+            dy = yy - y
+            row = yy * bpl
+            for xx in range(x0, x1 + 1):
+                dx = xx - x
+                if dx * dx + dy * dy > rr:
+                    continue
+
+                pos = row + xx
+                cur = int(mbytes[pos])
+
+                if mode == "erase_all":
+                    if cur != 0:
+                        mbytes[pos] = 0
+                elif mode == "erase_only_category":
+                    if selected_idx is not None and cur == selected_idx:
+                        mbytes[pos] = 0
+                elif mode == "erase_all_but_category":
+                    if selected_idx is not None and cur != 0 and cur != selected_idx:
+                        mbytes[pos] = 0
+
+        return QtCore.QRect(x0, y0, (x1 - x0 + 1), (y1 - y0 + 1))
 
     # ---------------- entity rendering ----------------
 
